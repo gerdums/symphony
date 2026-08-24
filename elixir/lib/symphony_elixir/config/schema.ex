@@ -137,14 +137,87 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:ssh_hosts, {:array, :string}, default: [])
+      field(:include_local, :boolean, default: false)
       field(:max_concurrent_agents_per_host, :integer)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:ssh_hosts, :max_concurrent_agents_per_host], empty_values: [])
+      |> cast(attrs, [:ssh_hosts, :include_local, :max_concurrent_agents_per_host], empty_values: [])
       |> validate_number(:max_concurrent_agents_per_host, greater_than: 0)
+    end
+  end
+
+  defmodule LinearAgentProof do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:required, :boolean, default: true)
+      field(:minimum_screenshots, :integer, default: 1)
+      field(:max_file_bytes, :integer, default: 10_485_760)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:required, :minimum_screenshots, :max_file_bytes], empty_values: [])
+      |> validate_number(:minimum_screenshots, greater_than_or_equal_to: 0)
+      |> validate_number(:max_file_bytes, greater_than: 0)
+    end
+  end
+
+  defmodule LinearAgent do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    alias SymphonyElixir.Config.Schema.LinearAgentProof
+
+    @primary_key false
+    embedded_schema do
+      field(:enabled, :boolean, default: false)
+      field(:display_name, :string, default: "Symphony Agent")
+      field(:endpoint, :string, default: "https://api.linear.app/graphql")
+      field(:token_endpoint, :string, default: "https://api.linear.app/oauth/token")
+      field(:access_token, :string)
+      field(:client_secret, :string)
+      field(:webhook_secret, :string)
+      field(:oauth_client_id, :string)
+      field(:app_user_id, :string)
+      field(:scopes, {:array, :string}, default: ["read", "write", "app:assignable", "app:mentionable"])
+      field(:webhook_max_age_ms, :integer, default: 60_000)
+      field(:secret_environment_names, {:array, :string}, default: [])
+      embeds_one(:proof, LinearAgentProof, on_replace: :update, defaults_to_struct: true)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [
+          :enabled,
+          :display_name,
+          :endpoint,
+          :token_endpoint,
+          :access_token,
+          :client_secret,
+          :webhook_secret,
+          :oauth_client_id,
+          :app_user_id,
+          :scopes,
+          :webhook_max_age_ms
+        ],
+        empty_values: []
+      )
+      |> cast_embed(:proof, with: &LinearAgentProof.changeset/2)
+      |> validate_required([:display_name, :endpoint, :token_endpoint, :scopes])
+      |> validate_length(:scopes, min: 1)
+      |> validate_number(:webhook_max_age_ms, greater_than: 0)
     end
   end
 
@@ -340,6 +413,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:polling, Polling, on_replace: :update, defaults_to_struct: true)
     embeds_one(:workspace, Workspace, on_replace: :update, defaults_to_struct: true)
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:linear_agent, LinearAgent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
     embeds_one(:claude, Claude, on_replace: :update, defaults_to_struct: true)
@@ -435,6 +509,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:polling, with: &Polling.changeset/2)
     |> cast_embed(:workspace, with: &Workspace.changeset/2)
     |> cast_embed(:worker, with: &Worker.changeset/2)
+    |> cast_embed(:linear_agent, with: &LinearAgent.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
     |> cast_embed(:claude, with: &Claude.changeset/2)
@@ -502,14 +577,101 @@ defmodule SymphonyElixir.Config.Schema do
       | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
     }
 
+    worker = finalize_worker(settings.worker)
+
     codex = %{
       settings.codex
       | approval_policy: normalize_keys(settings.codex.approval_policy),
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    linear_agent = finalize_linear_agent(settings.linear_agent)
+
+    %{
+      settings
+      | tracker: tracker,
+        workspace: workspace,
+        worker: worker,
+        codex: codex,
+        linear_agent: linear_agent
+    }
   end
+
+  defp finalize_linear_agent(linear_agent) do
+    display_name = resolve_secret_setting(linear_agent.display_name, System.get_env("LINEAR_AGENT_DISPLAY_NAME"))
+    access_token = resolve_secret_setting(linear_agent.access_token, System.get_env("LINEAR_AGENT_ACCESS_TOKEN"))
+    client_secret = resolve_secret_setting(linear_agent.client_secret, System.get_env("LINEAR_AGENT_CLIENT_SECRET"))
+    webhook_secret = resolve_secret_setting(linear_agent.webhook_secret, System.get_env("LINEAR_AGENT_WEBHOOK_SECRET"))
+    oauth_client_id = resolve_secret_setting(linear_agent.oauth_client_id, System.get_env("LINEAR_AGENT_OAUTH_CLIENT_ID"))
+    app_user_id = resolve_secret_setting(linear_agent.app_user_id, System.get_env("LINEAR_AGENT_APP_USER_ID"))
+
+    configured_values = [
+      linear_agent.display_name,
+      linear_agent.access_token,
+      linear_agent.client_secret,
+      linear_agent.webhook_secret,
+      linear_agent.oauth_client_id,
+      linear_agent.app_user_id
+    ]
+
+    %{
+      linear_agent
+      | enabled:
+          resolve_boolean_setting(
+            System.get_env("SYMPHONY_LINEAR_AGENT_ENABLED"),
+            linear_agent.enabled
+          ),
+        display_name: display_name,
+        access_token: access_token,
+        client_secret: client_secret,
+        webhook_secret: webhook_secret,
+        oauth_client_id: oauth_client_id,
+        app_user_id: app_user_id,
+        secret_environment_names:
+          Enum.uniq([
+            "LINEAR_AGENT_ACCESS_TOKEN",
+            "LINEAR_AGENT_CLIENT_SECRET",
+            "LINEAR_AGENT_DISPLAY_NAME",
+            "LINEAR_AGENT_WEBHOOK_SECRET",
+            "LINEAR_AGENT_OAUTH_CLIENT_ID",
+            "LINEAR_AGENT_APP_USER_ID"
+            | env_reference_names(configured_values)
+          ])
+    }
+  end
+
+  defp finalize_worker(worker) do
+    ssh_hosts =
+      case normalize_secret_value(System.get_env("SYMPHONY_WORKER_SSH_HOSTS")) do
+        nil ->
+          worker.ssh_hosts
+
+        value ->
+          value
+          |> String.split(",")
+          |> Enum.map(&String.trim/1)
+          |> Enum.reject(&(&1 == ""))
+          |> Enum.uniq()
+      end
+
+    include_local =
+      resolve_boolean_setting(
+        System.get_env("SYMPHONY_WORKER_INCLUDE_LOCAL"),
+        worker.include_local
+      )
+
+    %{worker | ssh_hosts: ssh_hosts, include_local: include_local}
+  end
+
+  defp resolve_boolean_setting(value, fallback) when is_binary(value) do
+    case value |> String.trim() |> String.downcase() do
+      value when value in ["1", "true", "yes", "on"] -> true
+      value when value in ["0", "false", "no", "off"] -> false
+      _ -> fallback
+    end
+  end
+
+  defp resolve_boolean_setting(_value, fallback), do: fallback
 
   defp normalize_keys(value) when is_map(value) do
     Enum.reduce(value, %{}, fn {key, raw_value}, normalized ->

@@ -7,6 +7,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   require Logger
   alias SymphonyElixir.{AgentClient, Codex.DynamicTool, Config, SSH}
+  alias SymphonyElixir.Linear.AgentBridge
 
   @initialize_id 1
   @thread_start_id 2
@@ -82,6 +83,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           turn_sandbox_policy: turn_sandbox_policy,
           thread_id: thread_id,
           workspace: workspace,
+          worker_host: worker_host,
           dynamic_tool_binding: dynamic_tool_binding
         },
         prompt,
@@ -92,7 +94,12 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     tool_executor =
       Keyword.get(opts, :tool_executor, fn tool, arguments ->
-        DynamicTool.execute(tool, arguments, dynamic_tool_binding, issue: issue)
+        DynamicTool.execute(tool, arguments, dynamic_tool_binding,
+          issue: issue,
+          issue_id: issue.id,
+          workspace: workspace,
+          worker_host: worker_host
+        )
       end)
 
     case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
@@ -111,7 +118,20 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+        turn_context = %{
+          thread_id: thread_id,
+          turn_id: turn_id,
+          issue_id: issue.id,
+          linear_agent_bridge: Keyword.get(opts, :linear_agent_bridge, AgentBridge)
+        }
+
+        case await_turn_completion(
+               port,
+               on_message,
+               tool_executor,
+               auto_approve_requests,
+               turn_context
+             ) do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -332,22 +352,46 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+  defp await_turn_completion(
+         port,
+         on_message,
+         tool_executor,
+         auto_approve_requests,
+         turn_context
+       ) do
     receive_loop(
       port,
       on_message,
       Config.settings!().codex.turn_timeout_ms,
       "",
       tool_executor,
-      auto_approve_requests
+      auto_approve_requests,
+      turn_context
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  defp receive_loop(
+         port,
+         on_message,
+         timeout_ms,
+         pending_line,
+         tool_executor,
+         auto_approve_requests,
+         turn_context
+       ) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+
+        handle_incoming(
+          port,
+          on_message,
+          complete_line,
+          timeout_ms,
+          tool_executor,
+          auto_approve_requests,
+          turn_context
+        )
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
@@ -356,8 +400,12 @@ defmodule SymphonyElixir.Codex.AppServer do
           timeout_ms,
           pending_line <> to_string(chunk),
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          turn_context
         )
+
+      {:linear_agent_prompt_available, issue_id} when issue_id == turn_context.issue_id ->
+        steer_from_linear(port, on_message, timeout_ms, tool_executor, auto_approve_requests, turn_context)
 
       {^port, {:exit_status, status}} ->
         {:error, {:port_exit, status}}
@@ -367,7 +415,15 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
+  defp handle_incoming(
+         port,
+         on_message,
+         data,
+         timeout_ms,
+         tool_executor,
+         auto_approve_requests,
+         turn_context
+       ) do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
@@ -407,9 +463,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           payload,
           payload_string,
           method,
-          timeout_ms,
-          tool_executor,
-          auto_approve_requests
+          {timeout_ms, tool_executor, auto_approve_requests, turn_context}
         )
 
       {:ok, payload} ->
@@ -423,7 +477,15 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(
+          port,
+          on_message,
+          timeout_ms,
+          "",
+          tool_executor,
+          auto_approve_requests,
+          turn_context
+        )
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -440,7 +502,15 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(
+          port,
+          on_message,
+          timeout_ms,
+          "",
+          tool_executor,
+          auto_approve_requests,
+          turn_context
+        )
     end
   end
 
@@ -463,9 +533,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          payload,
          payload_string,
          method,
-         timeout_ms,
-         tool_executor,
-         auto_approve_requests
+         {timeout_ms, tool_executor, auto_approve_requests, turn_context}
        ) do
     metadata = metadata_from_message(port, payload)
 
@@ -490,7 +558,15 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_input_required, payload}}
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(
+          port,
+          on_message,
+          timeout_ms,
+          "",
+          tool_executor,
+          auto_approve_requests,
+          turn_context
+        )
 
       :approval_required ->
         emit_message(
@@ -524,9 +600,63 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
 
           Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+
+          receive_loop(
+            port,
+            on_message,
+            timeout_ms,
+            "",
+            tool_executor,
+            auto_approve_requests,
+            turn_context
+          )
         end
     end
+  end
+
+  defp steer_from_linear(
+         port,
+         on_message,
+         timeout_ms,
+         tool_executor,
+         auto_approve_requests,
+         turn_context
+       ) do
+    case AgentBridge.take_prompt(turn_context.issue_id, turn_context.linear_agent_bridge) do
+      {:ok, %{id: prompt_id, body: body}} ->
+        request_id = System.unique_integer([:positive])
+
+        send_message(port, %{
+          "method" => "turn/steer",
+          "id" => request_id,
+          "params" => %{
+            "threadId" => turn_context.thread_id,
+            "expectedTurnId" => turn_context.turn_id,
+            "input" => [%{"type" => "text", "text" => body}],
+            "clientUserMessageId" => prompt_id
+          }
+        })
+
+        emit_message(
+          on_message,
+          :external_prompt_steered,
+          %{prompt_id: prompt_id},
+          metadata_from_message(port, %{})
+        )
+
+      :empty ->
+        :ok
+    end
+
+    receive_loop(
+      port,
+      on_message,
+      timeout_ms,
+      "",
+      tool_executor,
+      auto_approve_requests,
+      turn_context
+    )
   end
 
   defp maybe_handle_approval_request(

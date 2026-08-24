@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Linear.AgentBridge
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(
@@ -160,6 +162,135 @@ defmodule SymphonyElixir.AppServerTest do
       )
 
       assert {:error, :turn_timeout} = AppServer.run(workspace, "silent turn", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "follow-up prompts from a Linear agent session steer the active turn" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-linear-steer-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-STEER")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-steer.trace")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\n' "$line" >> "#{trace_file}"
+        case "$count" in
+          1) printf '%s\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-steer"}}}' ;;
+          4) printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-steer"}}}' ;;
+          5)
+            printf '%s\n' '{"id":999,"result":{"turnId":"turn-steer"}}'
+            printf '%s\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *) exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        linear_agent_enabled: true,
+        linear_agent_access_token: "oauth-token",
+        linear_agent_webhook_secret: "webhook-secret",
+        linear_agent_oauth_client_id: "oauth-client",
+        linear_agent_app_user_id: "app-user"
+      )
+
+      request_fun = fn payload, _headers ->
+        assert payload["query"] =~ "SymphonyCreateAgentActivity"
+
+        {:ok,
+         %{
+           status: 200,
+           body: %{
+             "data" => %{
+               "agentActivityCreate" => %{
+                 "success" => true,
+                 "agentActivity" => %{"id" => "activity-steer"}
+               }
+             }
+           }
+         }}
+      end
+
+      bridge_name = String.to_atom("linear_agent_steer_#{System.unique_integer([:positive])}")
+
+      start_supervised!({AgentBridge, name: bridge_name, orchestrator: nil, client_opts: [request_fun: request_fun]})
+
+      :ok =
+        AgentBridge.accept_webhook(
+          %{
+            "action" => "prompted",
+            "webhookId" => "webhook-steer",
+            "oauthClientId" => "oauth-client",
+            "appUserId" => "app-user",
+            "agentActivity" => %{
+              "id" => "prompt-activity",
+              "content" => %{"body" => "Please also verify the empty state."}
+            },
+            "agentSession" => %{"id" => "session-steer", "issueId" => "issue-steer"}
+          },
+          bridge_name
+        )
+
+      assert AgentBridge.session_for_issue("issue-steer", bridge_name) == "session-steer"
+
+      issue = %Issue{
+        id: "issue-steer",
+        identifier: "MT-STEER",
+        title: "Steer an active turn",
+        state: "In Progress"
+      }
+
+      test_pid = self()
+
+      task =
+        Task.async(fn ->
+          AppServer.run(workspace, "Start work", issue,
+            linear_agent_bridge: bridge_name,
+            on_message: fn
+              %{event: :session_started} -> send(test_pid, {:turn_started, self()})
+              _message -> :ok
+            end
+          )
+        end)
+
+      assert_receive {:turn_started, worker_pid}, 2_000
+      send(worker_pid, {:linear_agent_prompt_available, "issue-steer"})
+      assert {:ok, _result} = Task.await(task, 2_000)
+
+      steer_payload =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.map(&String.trim_leading(&1, "JSON:"))
+        |> Enum.map(&Jason.decode!/1)
+        |> Enum.find(&(&1["method"] == "turn/steer"))
+
+      assert get_in(steer_payload, ["params", "threadId"]) == "thread-steer"
+      assert get_in(steer_payload, ["params", "expectedTurnId"]) == "turn-steer"
+      assert get_in(steer_payload, ["params", "clientUserMessageId"]) == "prompt-activity"
+
+      assert get_in(steer_payload, ["params", "input", Access.at(0), "text"]) ==
+               "Please also verify the empty state."
     after
       File.rm_rf(test_root)
     end
