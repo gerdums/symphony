@@ -241,11 +241,13 @@ defmodule SymphonyElixir.Linear.AgentBridge do
         {:reply, :disabled, state}
 
       agent_session_id ->
+        proof_body =
+          "#{safe_activity_text(caption, 1_000)}\n\n" <>
+            "![#{escape_alt_text(caption)}](#{asset_url})"
+
         content = %{
-          "type" => "action",
-          "action" => "Captured proof",
-          "parameter" => caption,
-          "result" => "![#{escape_alt_text(caption)}](#{asset_url})"
+          "type" => "response",
+          "body" => proof_body
         }
 
         case create_activity(state, agent_session_id, content) do
@@ -763,7 +765,7 @@ defmodule SymphonyElixir.Linear.AgentBridge do
   defp activity_for_started_item(_item), do: nil
 
   defp activity_for_completed_item(%{"type" => "agentMessage", "text" => text}),
-    do: thought_activity(text)
+    do: response_activity(text)
 
   defp activity_for_completed_item(%{"type" => "reasoning"} = item),
     do: thought_activity(reasoning_summary(item))
@@ -809,6 +811,15 @@ defmodule SymphonyElixir.Linear.AgentBridge do
   end
 
   defp thought_activity(_text), do: nil
+
+  defp response_activity(text) when is_binary(text) do
+    case safe_activity_text(text, 4_000) do
+      "" -> nil
+      body -> %{"type" => "response", "body" => body}
+    end
+  end
+
+  defp response_activity(_text), do: nil
 
   defp reasoning_summary(%{"summary" => summary}) when is_list(summary) do
     summary

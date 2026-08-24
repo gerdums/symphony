@@ -558,8 +558,8 @@ defmodule SymphonyElixir.LinearAgentTest do
     assert_received {:activity,
                      %{
                        "content" => %{
-                         "type" => "action",
-                         "result" => "![The updated screen](https://uploads.linear.app/private-proof)"
+                         "type" => "response",
+                         "body" => "The updated screen\n\n![The updated screen](https://uploads.linear.app/private-proof)"
                        }
                      }}
 
@@ -701,7 +701,7 @@ defmodule SymphonyElixir.LinearAgentTest do
     assert_receive {:activity,
                     %{
                       "content" => %{
-                        "type" => "thought",
+                        "type" => "response",
                         "body" => "I updated the implementation and am validating it now."
                       },
                       "ephemeral" => false
