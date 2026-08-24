@@ -473,6 +473,22 @@ defmodule SymphonyElixir.LinearAgentTest do
              }
            }}
 
+        payload["query"] =~ "SymphonyUpdateAgentSession" ->
+          send(test_pid, {:session_update, payload["variables"]})
+
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "data" => %{
+                 "agentSessionUpdate" => %{
+                   "success" => true,
+                   "agentSession" => %{"id" => "session-1"}
+                 }
+               }
+             }
+           }}
+
         true ->
           flunk("unexpected GraphQL operation")
       end
@@ -497,6 +513,98 @@ defmodule SymphonyElixir.LinearAgentTest do
     assert :ok = AgentBridge.start_work(%Issue{id: "issue-1"}, bridge_name)
 
     assert_received {:assignment_request, %{"issueId" => "issue-1", "assigneeId" => "app-user"}}
+    assert_received {:session_update, %{"id" => "session-1", "input" => %{"plan" => [plan]}}}
+    assert plan["content"] == "Preparing the ticket workspace"
+  end
+
+  test "bridge keeps one native session visibly waiting until a worker slot opens" do
+    test_pid = self()
+
+    request_fun = fn payload, _headers ->
+      cond do
+        payload["query"] =~ "SymphonyCreateAgentActivity" ->
+          send(test_pid, {:activity, payload["variables"]["input"]})
+
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "data" => %{
+                 "agentActivityCreate" => %{
+                   "success" => true,
+                   "agentActivity" => %{"id" => "activity-1"}
+                 }
+               }
+             }
+           }}
+
+        payload["query"] =~ "SymphonyUpdateAgentSession" ->
+          send(test_pid, {:session_update, payload["variables"]})
+
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "data" => %{
+                 "agentSessionUpdate" => %{
+                   "success" => true,
+                   "agentSession" => %{"id" => "session-waiting"}
+                 }
+               }
+             }
+           }}
+
+        true ->
+          flunk("unexpected GraphQL operation")
+      end
+    end
+
+    bridge_name = String.to_atom("linear_agent_waiting_bridge_#{System.unique_integer([:positive])}")
+
+    start_supervised!({AgentBridge, name: bridge_name, orchestrator: nil, client_opts: [request_fun: request_fun]})
+
+    assert :ok =
+             AgentBridge.accept_webhook(
+               %{
+                 "action" => "created",
+                 "webhookId" => "waiting-webhook",
+                 "oauthClientId" => "oauth-client",
+                 "appUserId" => "app-user",
+                 "agentSession" => %{"id" => "session-waiting", "issueId" => "issue-waiting"}
+               },
+               bridge_name
+             )
+
+    issue = %Issue{id: "issue-waiting"}
+    assert :ok = AgentBridge.waiting_for_slot(issue, bridge_name)
+    assert :ok = AgentBridge.waiting_for_slot(issue, bridge_name)
+    assert AgentBridge.session_for_issue(issue.id, bridge_name) == "session-waiting"
+
+    assert_received {:session_update,
+                     %{
+                       "id" => "session-waiting",
+                       "input" => %{"plan" => [%{"content" => waiting_text}]}
+                     }}
+
+    assert waiting_text =~ "Waiting for an available worker slot"
+
+    waiting_activities =
+      receive_activities([])
+      |> Enum.filter(&(get_in(&1, ["content", "body"]) =~ "waiting for an available worker slot"))
+
+    assert length(waiting_activities) == 1
+
+    assert :ok = AgentBridge.start_work(issue, bridge_name)
+
+    assert_received {:session_update,
+                     %{
+                       "id" => "session-waiting",
+                       "input" => %{
+                         "plan" => [
+                           %{"content" => "Preparing the ticket workspace", "status" => "inProgress"}
+                         ]
+                       }
+                     }}
   end
 
   test "proof tool only uploads an image contained in the current workspace" do
@@ -552,5 +660,13 @@ defmodule SymphonyElixir.LinearAgentTest do
 
     assert rejected["success"] == false
     assert Jason.decode!(rejected["output"])["error"]["message"] =~ "inside the current workspace"
+  end
+
+  defp receive_activities(acc) do
+    receive do
+      {:activity, activity} -> receive_activities([activity | acc])
+    after
+      25 -> Enum.reverse(acc)
+    end
   end
 end

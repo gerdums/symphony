@@ -10,9 +10,9 @@ defmodule SymphonyElixir.Workspace do
 
   @type worker_host :: String.t() | nil
 
-  @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
+  @spec create_for_issue(map() | String.t() | nil, worker_host(), keyword()) ::
           {:ok, Path.t()} | {:error, term()}
-  def create_for_issue(issue_or_identifier, worker_host \\ nil) do
+  def create_for_issue(issue_or_identifier, worker_host \\ nil, opts \\ []) do
     issue_context = issue_context(issue_or_identifier)
 
     try do
@@ -25,9 +25,13 @@ defmodule SymphonyElixir.Workspace do
           :ok ->
             {:ok, workspace}
 
-          {:error, _reason} = error ->
-            cleanup_failed_new_workspace(workspace, created?, worker_host)
-            error
+          {:error, reason} = error ->
+            if created? and Keyword.get(opts, :preserve_on_failure, false) do
+              {:error, {:workspace_setup_failed, workspace, reason}}
+            else
+              cleanup_failed_new_workspace(workspace, created?, worker_host)
+              error
+            end
         end
       end
     rescue
@@ -35,6 +39,31 @@ defmodule SymphonyElixir.Workspace do
         Logger.error("Workspace creation failed #{issue_log_context(issue_context)} worker_host=#{worker_host_for_log(worker_host)} error=#{Exception.message(error)}")
         {:error, error}
     end
+  end
+
+  @doc """
+  Re-runs the configured `after_create` hook for a preserved partial workspace.
+
+  Setup repair depends on this hook being safe to run again after a partial
+  failure. Projects should make cloning, branch creation, and dependency setup
+  idempotent when setup repair is enabled.
+  """
+  @spec retry_after_create_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
+          :ok | {:error, term()}
+  def retry_after_create_hook(workspace, issue_or_identifier, worker_host \\ nil)
+      when is_binary(workspace) do
+    issue_context = issue_context(issue_or_identifier)
+
+    case Config.settings!().hooks.after_create do
+      nil -> :ok
+      command -> run_hook(command, workspace, issue_context, "after_create", worker_host)
+    end
+  end
+
+  @doc false
+  @spec cleanup_failed_setup(Path.t(), worker_host()) :: :ok
+  def cleanup_failed_setup(workspace, worker_host \\ nil) when is_binary(workspace) do
+    cleanup_failed_new_workspace(workspace, true, worker_host)
   end
 
   defp ensure_workspace(workspace, nil) do

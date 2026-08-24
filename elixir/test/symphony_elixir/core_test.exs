@@ -1655,6 +1655,90 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "agent runner repairs a failed setup and validates the hook before ticket work" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-setup-repair-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      attempt_log = Path.join(test_root, "setup-attempts")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-repair"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-repair"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        setup_repair_attempts: 1,
+        hook_after_create: """
+        if [ -f "#{attempt_log}" ]; then count=$(wc -l < "#{attempt_log}"); else count=0; fi
+        printf 'attempt\\n' >> "#{attempt_log}"
+        if [ "$count" -eq 0 ]; then printf partial > partial.txt; exit 17; fi
+        printf ready > READY
+        """,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "setup-repair-issue",
+        identifier: "MT-SETUP-REPAIR",
+        title: "Recover setup",
+        description: "Validate setup recovery",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-SETUP-REPAIR",
+        labels: []
+      }
+
+      assert :ok =
+               AgentRunner.run(
+                 issue,
+                 self(),
+                 issue_state_fetcher: fn [_issue_id] ->
+                   {:ok, [%{issue | state: "Done"}]}
+                 end
+               )
+
+      workspace = Path.join(workspace_root, issue.identifier)
+      assert File.read!(Path.join(workspace, "READY")) == "ready"
+      assert File.read!(Path.join(workspace, "partial.txt")) == "partial"
+      assert String.split(String.trim(File.read!(attempt_log)), "\n") == ["attempt", "attempt"]
+
+      assert_receive {:codex_worker_update, "setup-repair-issue", %{event: :session_started, phase: :setup_repair}}
+
+      assert_receive {:codex_worker_update, "setup-repair-issue", %{event: :session_started}}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "agent runner forwards timestamped codex updates to recipient" do
     test_root =
       Path.join(

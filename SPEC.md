@@ -455,6 +455,12 @@ Fields:
 - `max_retry_backoff_ms` (integer)
   - Default: `300000` (5 minutes)
   - Changes SHOULD be re-applied at runtime and affect future retry scheduling.
+- `setup_repair_attempts` (non-negative integer)
+  - Default: `1`
+  - Controls the number of bounded setup-recovery coding-agent turns after a new workspace's
+    `after_create` hook fails.
+  - `0` disables setup recovery.
+  - Invalid values fail configuration validation.
 - `max_concurrent_agents_by_state` (map `state_name -> positive integer`)
   - Default: empty map.
   - State keys are normalized (`trim + lowercase`) for lookup.
@@ -623,6 +629,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
+- `agent.setup_repair_attempts`: non-negative integer, default `1`
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
@@ -895,6 +902,11 @@ hooks (for example `after_create` and/or `before_run`).
 Failure handling:
 
 - Workspace population/synchronization failures return an error for the current attempt.
+- When `agent.setup_repair_attempts` is positive, an implementation MAY preserve a newly created
+  partial workspace, run a bounded setup-recovery agent, and rerun `after_create` as the validation
+  gate. The hook MUST be documented as idempotent when this behavior is enabled.
+- The recovery prompt MUST use sanitized, bounded failure output and MUST prohibit credential
+  access, security weakening, and ticket implementation during setup recovery.
 - If failure happens while creating a brand-new workspace, implementations MAY remove the partially
   prepared directory.
 - Reused workspaces SHOULD NOT be destructively reset on population failure unless that policy is
@@ -920,7 +932,8 @@ Execution contract:
 
 Failure semantics:
 
-- `after_create` failure or timeout is fatal to workspace creation.
+- `after_create` failure or timeout is fatal to workspace creation unless bounded setup recovery is
+  enabled and a subsequent rerun of the hook succeeds.
 - `before_run` failure or timeout is fatal to the current run attempt.
 - `after_run` failure or timeout is logged and ignored.
 - `before_remove` failure or timeout is logged and ignored.
@@ -2324,7 +2337,7 @@ Extension config:
 
 - `linear_agent.enabled` (boolean, default `false`)
 - `linear_agent.assign_on_start` (boolean, default `false`; assign the issue to the configured app
-  user after workspace preparation succeeds and before the coding-agent session starts)
+  user after a worker slot is admitted and before workspace preparation begins)
   - `SYMPHONY_LINEAR_AGENT_ENABLED` MAY override this in host-private deployment configuration.
 - `linear_agent.display_name` (string or `$VAR`, default `Symphony Agent`)
 - `linear_agent.endpoint` (URL, default `https://api.linear.app/graphql`)
@@ -2350,6 +2363,11 @@ the workflow.
 
 - A Linear Agent Session is the durable user-facing conversation and MUST NOT depend on which
   worker host executes the run.
+- When an eligible issue is waiting only because all configured worker slots are full, Symphony
+  SHOULD create or reuse its native session and publish a durable waiting plan/activity. The issue
+  MUST remain unassigned until a worker slot is actually admitted.
+- Admission SHOULD update the same session to workspace preparation. When assignment-on-start is
+  enabled, the app-user assignment MUST succeed before setup or coding work begins.
 - The webhook endpoint MUST verify `Linear-Signature` against the raw body using HMAC-SHA256 and
   SHOULD reject stale `webhookTimestamp` values.
 - A `created` event SHOULD register the supplied session and queue its `promptContext`.

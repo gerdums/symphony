@@ -303,8 +303,7 @@ defmodule SymphonyElixir.Orchestrator do
       |> reconcile_blocked_issues()
 
     with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
-         true <- available_slots(state) > 0 do
+         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
       choose_issues(issues, state)
     else
       {:error, :missing_linear_api_token} ->
@@ -343,9 +342,6 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.error("Failed to fetch from issue tracker: #{inspect(reason)}")
-        state
-
-      false ->
         state
     end
   end
@@ -828,10 +824,16 @@ defmodule SymphonyElixir.Orchestrator do
     issues
     |> sort_issues_for_dispatch()
     |> Enum.reduce(state, fn issue, state_acc ->
-      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
-        dispatch_issue(state_acc, issue)
-      else
-        state_acc
+      cond do
+        should_dispatch_issue?(issue, state_acc, active_states, terminal_states) ->
+          dispatch_issue(state_acc, issue)
+
+        queueable_issue?(issue, state_acc, active_states, terminal_states) ->
+          :ok = AgentBridge.waiting_for_slot(issue)
+          state_acc
+
+        true ->
+          state_acc
       end
     end)
   end
@@ -872,6 +874,20 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
+
+  defp queueable_issue?(
+         %Issue{} = issue,
+         %State{running: running, claimed: claimed, blocked: blocked},
+         active_states,
+         terminal_states
+       ) do
+    candidate_issue?(issue, active_states, terminal_states) and
+      !MapSet.member?(claimed, issue.id) and
+      !Map.has_key?(running, issue.id) and
+      !Map.has_key?(blocked, issue.id)
+  end
+
+  defp queueable_issue?(_issue, _state, _active_states, _terminal_states), do: false
 
   defp state_slots_available?(%Issue{state: issue_state}, running) when is_map(running) do
     limit = Config.max_concurrent_agents_for_state(issue_state)
@@ -993,6 +1009,7 @@ defmodule SymphonyElixir.Orchestrator do
     case select_worker_host(state, preferred_worker_host) do
       :no_worker_capacity ->
         Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
+        :ok = AgentBridge.waiting_for_slot(issue)
         state
 
       worker_host ->
@@ -1257,6 +1274,7 @@ defmodule SymphonyElixir.Orchestrator do
       end
     else
       Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
+      :ok = AgentBridge.waiting_for_slot(issue)
 
       {:noreply,
        schedule_issue_retry(

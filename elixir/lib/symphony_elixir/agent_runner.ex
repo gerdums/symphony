@@ -45,8 +45,13 @@ defmodule SymphonyElixir.AgentRunner do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
     with {:ok, _session_id} <- ensure_linear_agent_session(issue),
-         {:ok, workspace} <- Workspace.create_for_issue(issue, worker_host),
-         :ok <- start_linear_agent_work(issue) do
+         :ok <- start_linear_agent_work(issue),
+         {:ok, workspace} <-
+           prepare_workspace_with_repair(
+             issue,
+             codex_update_recipient,
+             worker_host
+           ) do
       send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
       try do
@@ -61,6 +66,166 @@ defmodule SymphonyElixir.AgentRunner do
         {:error, reason}
     end
   end
+
+  defp prepare_workspace_with_repair(issue, codex_update_recipient, worker_host) do
+    repair_attempts = Config.settings!().agent.setup_repair_attempts
+
+    case Workspace.create_for_issue(issue, worker_host, preserve_on_failure: repair_attempts > 0) do
+      {:ok, workspace} ->
+        {:ok, workspace}
+
+      {:error, {:workspace_setup_failed, workspace, reason}} ->
+        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+
+        repair_workspace_setup(
+          workspace,
+          issue,
+          reason,
+          repair_attempts,
+          repair_attempts,
+          codex_update_recipient,
+          worker_host
+        )
+
+      {:error, reason} ->
+        {:error, compact_workspace_setup_error(reason)}
+    end
+  end
+
+  defp repair_workspace_setup(
+         workspace,
+         issue,
+         reason,
+         attempts_remaining,
+         total_attempts,
+         codex_update_recipient,
+         worker_host
+       )
+       when attempts_remaining > 0 do
+    attempt = total_attempts - attempts_remaining + 1
+    :ok = report_setup_repair_started(issue, attempt, total_attempts)
+
+    _repair_result =
+      AppServer.run(
+        workspace,
+        setup_repair_prompt(reason, attempt, total_attempts),
+        issue,
+        worker_host: worker_host,
+        on_message: setup_repair_message_handler(codex_update_recipient, issue)
+      )
+
+    case Workspace.retry_after_create_hook(workspace, issue, worker_host) do
+      :ok ->
+        :ok = report_setup_repair_succeeded(issue)
+        {:ok, workspace}
+
+      {:error, next_reason} when attempts_remaining > 1 ->
+        repair_workspace_setup(
+          workspace,
+          issue,
+          next_reason,
+          attempts_remaining - 1,
+          total_attempts,
+          codex_update_recipient,
+          worker_host
+        )
+
+      {:error, next_reason} ->
+        Workspace.cleanup_failed_setup(workspace, worker_host)
+        {:error, compact_workspace_setup_error(next_reason)}
+    end
+  end
+
+  defp setup_repair_message_handler(recipient, issue) do
+    fn message ->
+      send_codex_update(recipient, issue, Map.put(message, :phase, :setup_repair))
+    end
+  end
+
+  defp report_setup_repair_started(%Issue{id: issue_id}, attempt, total_attempts)
+       when is_binary(issue_id) do
+    AgentBridge.setup_repair_started(issue_id, attempt, total_attempts)
+  end
+
+  defp report_setup_repair_started(_issue, _attempt, _total_attempts), do: :ok
+
+  defp report_setup_repair_succeeded(%Issue{id: issue_id}) when is_binary(issue_id) do
+    AgentBridge.setup_repair_succeeded(issue_id)
+  end
+
+  defp report_setup_repair_succeeded(_issue), do: :ok
+
+  defp setup_repair_prompt(reason, attempt, total_attempts) do
+    """
+    You are the bounded workspace-setup recovery phase for an unattended Symphony run.
+
+    Workspace setup failed before ticket implementation could begin. Diagnose and fix only the setup problem, then stop. Symphony will rerun the configured setup hook after this turn and will continue the original ticket only if that hook succeeds.
+
+    Recovery rules:
+    - Do not implement the ticket or make product changes during this phase.
+    - You may repair incomplete workspace state, dependency/tool versions, and required non-secret host tooling.
+    - Never inspect, print, copy, rotate, or expose credentials, tokens, keychains, environment secrets, or private configuration.
+    - Do not weaken authentication, sandboxing, repository protections, or verification checks.
+    - Do not edit Symphony's WORKFLOW.md. Prefer the smallest reversible repair.
+    - Validate the underlying failing tool when practical, and finish this turn once setup is ready to retry.
+
+    Recovery attempt: #{attempt}/#{total_attempts}
+
+    Sanitized setup failure:
+    #{setup_failure_excerpt(reason)}
+    """
+  end
+
+  defp setup_failure_excerpt({:workspace_hook_failed, hook_name, status, output}) do
+    "hook=#{hook_name} exit_status=#{status}\n" <> sanitize_setup_output(output)
+  end
+
+  defp setup_failure_excerpt({:workspace_hook_timeout, hook_name, timeout_ms}) do
+    "hook=#{hook_name} timed_out_after_ms=#{timeout_ms}"
+  end
+
+  defp setup_failure_excerpt(reason), do: reason |> inspect() |> sanitize_setup_output()
+
+  defp sanitize_setup_output(output) do
+    output
+    |> IO.iodata_to_binary()
+    |> tail_text(6_000)
+    |> redact_configured_secrets()
+    |> String.replace(~r{(?i)(authorization|bearer|token|secret|password)(\s*[:=]?\s+)[^\s]+}, "\\1\\2[REDACTED]")
+    |> String.replace(~r{(?i)://[^/@\s:]+:[^/@\s]+@}, "://[REDACTED]@")
+    |> String.replace(~r{\b(?:ghp|github_pat|lin_api)_[A-Za-z0-9_\-]+\b}, "[REDACTED]")
+  end
+
+  defp redact_configured_secrets(output) do
+    settings = Config.settings!()
+
+    [
+      settings.tracker.api_key,
+      settings.linear_agent.access_token,
+      settings.linear_agent.client_secret,
+      settings.linear_agent.webhook_secret
+    ]
+    |> Enum.filter(&(is_binary(&1) and byte_size(&1) >= 8))
+    |> Enum.reduce(output, fn secret, redacted ->
+      String.replace(redacted, secret, "[REDACTED]")
+    end)
+  end
+
+  defp tail_text(text, max_characters) when is_binary(text) do
+    length = String.length(text)
+
+    if length > max_characters do
+      "... (earlier output omitted)\n" <> String.slice(text, length - max_characters, max_characters)
+    else
+      text
+    end
+  end
+
+  defp compact_workspace_setup_error({:workspace_hook_failed, hook_name, status, _output}) do
+    {:workspace_hook_failed, hook_name, status}
+  end
+
+  defp compact_workspace_setup_error(reason), do: reason
 
   defp ensure_linear_agent_session(issue) do
     case AgentBridge.ensure_session(issue) do
