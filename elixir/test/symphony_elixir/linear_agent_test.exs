@@ -508,7 +508,7 @@ defmodule SymphonyElixir.LinearAgentTest do
                         "action" => "Running command",
                         "parameter" => "Executing a workspace command"
                       },
-                      "ephemeral" => true
+                      "ephemeral" => false
                     }},
                    1_000
 
@@ -537,7 +537,7 @@ defmodule SymphonyElixir.LinearAgentTest do
                         "type" => "thought",
                         "body" => "Checking the current implementation.\n\nBearer [REDACTED]"
                       },
-                      "ephemeral" => true
+                      "ephemeral" => false
                     }},
                    1_000
 
@@ -566,7 +566,7 @@ defmodule SymphonyElixir.LinearAgentTest do
                         "type" => "thought",
                         "body" => "I updated the implementation and am validating it now."
                       },
-                      "ephemeral" => true
+                      "ephemeral" => false
                     }},
                    1_000
   end
@@ -752,8 +752,29 @@ defmodule SymphonyElixir.LinearAgentTest do
   end
 
   test "bridge does not create a native session for an unadmitted queued ticket" do
-    request_fun = fn _payload, _headers ->
-      flunk("queued tickets without a native session must not call Linear")
+    test_pid = self()
+
+    request_fun = fn payload, _headers ->
+      cond do
+        payload["query"] =~ "SymphonyFindAgentSession" ->
+          send(test_pid, :existing_session_lookup)
+
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "data" => %{
+                 "issue" => %{"agentSessions" => %{"nodes" => []}}
+               }
+             }
+           }}
+
+        payload["query"] =~ "SymphonyCreateAgentSession" ->
+          flunk("queued tickets without a native session must not create one")
+
+        true ->
+          flunk("unexpected GraphQL operation")
+      end
     end
 
     bridge_name = String.to_atom("linear_agent_existing_wait_bridge_#{System.unique_integer([:positive])}")
@@ -762,7 +783,98 @@ defmodule SymphonyElixir.LinearAgentTest do
 
     issue = %Issue{id: "issue-not-admitted"}
     assert :ok = AgentBridge.waiting_for_existing_slot(issue, bridge_name)
+    assert_receive :existing_session_lookup, 1_000
     assert AgentBridge.session_for_issue(issue.id, bridge_name) == nil
+
+    assert :ok = AgentBridge.waiting_for_existing_slot(issue, bridge_name)
+    refute_receive :existing_session_lookup, 100
+  end
+
+  test "bridge reconnects an existing native session after restart and marks it waiting" do
+    test_pid = self()
+
+    request_fun = fn payload, _headers ->
+      cond do
+        payload["query"] =~ "SymphonyFindAgentSession" ->
+          send(test_pid, :existing_session_lookup)
+
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "data" => %{
+                 "issue" => %{
+                   "agentSessions" => %{
+                     "nodes" => [
+                       %{
+                         "id" => "session-reconnected",
+                         "status" => "active",
+                         "appUser" => %{"id" => "app-user"}
+                       }
+                     ]
+                   }
+                 }
+               }
+             }
+           }}
+
+        payload["query"] =~ "SymphonyUpdateAgentSession" ->
+          send(test_pid, {:session_update, payload["variables"]})
+
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "data" => %{
+                 "agentSessionUpdate" => %{
+                   "success" => true,
+                   "agentSession" => %{"id" => "session-reconnected"}
+                 }
+               }
+             }
+           }}
+
+        payload["query"] =~ "SymphonyCreateAgentActivity" ->
+          send(test_pid, {:activity, payload["variables"]["input"]})
+
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "data" => %{
+                 "agentActivityCreate" => %{
+                   "success" => true,
+                   "agentActivity" => %{"id" => "activity-reconnected"}
+                 }
+               }
+             }
+           }}
+
+        payload["query"] =~ "SymphonyCreateAgentSession" ->
+          flunk("recovery must reuse the existing native session")
+
+        true ->
+          flunk("unexpected GraphQL operation")
+      end
+    end
+
+    bridge_name = String.to_atom("linear_agent_reconnect_wait_bridge_#{System.unique_integer([:positive])}")
+
+    start_supervised!({AgentBridge, name: bridge_name, orchestrator: nil, client_opts: [request_fun: request_fun]})
+
+    issue = %Issue{id: "issue-reconnected"}
+    assert :ok = AgentBridge.waiting_for_existing_slot(issue, bridge_name)
+    assert_receive :existing_session_lookup, 1_000
+
+    assert_receive {:session_update,
+                    %{
+                      "id" => "session-reconnected",
+                      "input" => %{"plan" => [%{"content" => waiting_text}]}
+                    }},
+                   1_000
+
+    assert waiting_text =~ "Waiting for an available worker slot"
+    assert AgentBridge.session_for_issue(issue.id, bridge_name) == "session-reconnected"
   end
 
   test "bridge marks recoverable worker failures in the plan without an error activity" do

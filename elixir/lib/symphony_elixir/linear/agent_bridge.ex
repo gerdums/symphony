@@ -23,6 +23,7 @@ defmodule SymphonyElixir.Linear.AgentBridge do
             proof_counts: %{},
             waiting_issues: MapSet.new(),
             waiting_session_requests: MapSet.new(),
+            checked_existing_waiting_sessions: MapSet.new(),
             work_started_issues: MapSet.new(),
             failure_notified_issues: MapSet.new(),
             seen_webhooks: MapSet.new()
@@ -299,12 +300,18 @@ defmodule SymphonyElixir.Linear.AgentBridge do
       MapSet.member?(state.waiting_issues, issue_id) ->
         {:noreply, state}
 
+      MapSet.member?(state.waiting_session_requests, issue_id) ->
+        {:noreply, state}
+
       agent_session_id = session_id(state, issue_id) ->
         publish_waiting_status_async(state, agent_session_id)
         {:noreply, mark_waiting(state, issue_id)}
 
-      true ->
+      MapSet.member?(state.checked_existing_waiting_sessions, issue_id) ->
         {:noreply, state}
+
+      true ->
+        {:noreply, request_existing_waiting_session(state, issue_id, settings.app_user_id)}
     end
   end
 
@@ -380,6 +387,30 @@ defmodule SymphonyElixir.Linear.AgentBridge do
       {:error, reason, state} ->
         Logger.warning("Unable to create a Linear waiting session for issue_id=#{issue_id}: #{inspect(reason)}")
         {:noreply, state}
+    end
+  end
+
+  def handle_info({:existing_waiting_session_result, issue_id, result}, state) do
+    state = clear_waiting_session_request(state, issue_id)
+
+    case result do
+      {:ok, %{"id" => session_id}} when is_binary(session_id) ->
+        state = put_session(state, issue_id, session_id)
+        publish_waiting_status_async(state, session_id)
+        {:noreply, mark_waiting(state, issue_id)}
+
+      :not_found ->
+        {:noreply, mark_existing_waiting_session_checked(state, issue_id)}
+
+      {:error, reason} ->
+        Logger.warning("Unable to recover an existing Linear waiting session for issue_id=#{issue_id}: #{inspect(reason)}")
+
+        {:noreply, mark_existing_waiting_session_checked(state, issue_id)}
+
+      other ->
+        Logger.warning("Invalid existing Linear waiting session response for issue_id=#{issue_id}: #{inspect(other)}")
+
+        {:noreply, mark_existing_waiting_session_checked(state, issue_id)}
     end
   end
 
@@ -745,7 +776,6 @@ defmodule SymphonyElixir.Linear.AgentBridge do
   end
 
   defp ephemeral_update?(%{event: :session_started}), do: true
-  defp ephemeral_update?(%{event: :notification}), do: true
   defp ephemeral_update?(_update), do: false
 
   defp plan_for_update(%{event: :notification} = update) do
@@ -936,6 +966,21 @@ defmodule SymphonyElixir.Linear.AgentBridge do
     }
   end
 
+  defp request_existing_waiting_session(state, issue_id, app_user_id) do
+    bridge = self()
+
+    {:ok, _pid} =
+      Task.start(fn ->
+        result = state.client.find_open_session(issue_id, app_user_id, client_opts(state))
+        send(bridge, {:existing_waiting_session_result, issue_id, result})
+      end)
+
+    %{
+      state
+      | waiting_session_requests: MapSet.put(state.waiting_session_requests, issue_id)
+    }
+  end
+
   defp waiting_session_from_result(state, issue_id, {:ok, %{"id" => session_id}})
        when is_binary(session_id) do
     selected_session_id = session_id(state, issue_id) || session_id
@@ -964,6 +1009,13 @@ defmodule SymphonyElixir.Linear.AgentBridge do
     }
   end
 
+  defp mark_existing_waiting_session_checked(state, issue_id) do
+    %{
+      state
+      | checked_existing_waiting_sessions: MapSet.put(state.checked_existing_waiting_sessions, issue_id)
+    }
+  end
+
   defp run_async(fun) when is_function(fun, 0) do
     {:ok, _pid} = Task.start(fun)
     :ok
@@ -986,7 +1038,8 @@ defmodule SymphonyElixir.Linear.AgentBridge do
     %{
       state
       | sessions_by_issue: Map.put(state.sessions_by_issue, issue_id, session_id),
-        issue_by_session: Map.put(state.issue_by_session, session_id, issue_id)
+        issue_by_session: Map.put(state.issue_by_session, session_id, issue_id),
+        checked_existing_waiting_sessions: MapSet.delete(state.checked_existing_waiting_sessions, issue_id)
     }
   end
 

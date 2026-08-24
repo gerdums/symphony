@@ -2384,7 +2384,8 @@ the workflow.
   remains active.
 - The bridge MUST consume the actual top-level app-server notification payload and mirror plan
   updates, visible reasoning summaries, agent messages, and tool/file/command lifecycle events into
-  the same native session. It MUST NOT forward hidden reasoning or unbounded raw command output.
+  the same native session as durable activities. It MUST NOT forward hidden reasoning or unbounded
+  raw command output.
 - Prompts sent from the native Linear session SHOULD steer the active Codex turn and MUST remain
   associated with the issue's durable session across worker-host changes and process restarts.
 - Waiting-session provisioning and progress/activity publication MUST run outside the bridge's

@@ -318,7 +318,8 @@ native error notification per bridge lifetime while Symphony keeps the session a
 attached.
 
 While a Codex turn is active, Symphony mirrors its plan, visible reasoning summaries, agent
-messages, and tool/file/command lifecycle into the same native Linear Agent Session. Replies sent
+messages, and tool/file/command lifecycle as durable activities in the same native Linear Agent
+Session, so reopening the session shows the work rather than only its current plan. Replies sent
 from that session steer the active Codex turn. Raw hidden reasoning and command output are not
 forwarded, and streamed text is bounded and scrubbed for credential-like values.
 
