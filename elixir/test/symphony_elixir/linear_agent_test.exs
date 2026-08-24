@@ -422,6 +422,51 @@ defmodule SymphonyElixir.LinearAgentTest do
     assert_received {:upload_put, "https://uploads.example.test/signed", [{"content-type", "image/png"}], ^bytes}
   end
 
+  test "agent client adds the signed content type when Linear omits it from upload headers" do
+    test_pid = self()
+    bytes = <<1, 2, 3, 4>>
+
+    request_fun = fn _payload, _headers ->
+      {:ok,
+       %{
+         status: 200,
+         body: %{
+           "data" => %{
+             "fileUpload" => %{
+               "success" => true,
+               "uploadFile" => %{
+                 "uploadUrl" => "https://uploads.example.test/signed",
+                 "assetUrl" => "https://uploads.linear.app/private-proof",
+                 "headers" => [
+                   %{"key" => "x-goog-content-length-range", "value" => "0,10485760"},
+                   %{"key" => "Content-Disposition", "value" => "inline"}
+                 ]
+               }
+             }
+           }
+         }
+       }}
+    end
+
+    upload_request_fun = fn _url, headers, _body ->
+      send(test_pid, {:upload_headers, headers})
+      {:ok, %{status: 200}}
+    end
+
+    assert {:ok, "https://uploads.linear.app/private-proof"} =
+             AgentClient.upload_file("proof.png", "image/png", bytes,
+               request_fun: request_fun,
+               upload_request_fun: upload_request_fun
+             )
+
+    assert_received {:upload_headers,
+                     [
+                       {"x-goog-content-length-range", "0,10485760"},
+                       {"Content-Disposition", "inline"},
+                       {"Content-Type", "image/png"}
+                     ]}
+  end
+
   test "webhook verifier checks the raw body HMAC and freshness" do
     timestamp = 1_777_777_777_000
     raw_body = Jason.encode!(%{"webhookTimestamp" => timestamp, "type" => "AgentSessionEvent"})

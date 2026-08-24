@@ -192,7 +192,11 @@ defmodule SymphonyElixir.Linear.AgentClient do
          {:ok, upload} <- get_graphql_data(body, ["fileUpload", "uploadFile"]),
          {:ok, upload_url, asset_url, headers} <- normalize_upload(upload),
          {:ok, %{status: status}} when status in 200..299 <-
-           upload_request(opts).(upload_url, headers, bytes) do
+           upload_request(opts).(
+             upload_url,
+             ensure_upload_content_type(headers, content_type),
+             bytes
+           ) do
       {:ok, asset_url}
     else
       {:ok, %{status: status}} -> {:error, {:linear_upload_status, status}}
@@ -343,6 +347,14 @@ defmodule SymphonyElixir.Linear.AgentClient do
   end
 
   defp normalize_upload(_upload), do: {:error, :linear_agent_invalid_upload_payload}
+
+  defp ensure_upload_content_type(headers, content_type) do
+    if Enum.any?(headers, fn {key, _value} -> String.downcase(key) == "content-type" end) do
+      headers
+    else
+      headers ++ [{"Content-Type", content_type}]
+    end
+  end
 
   defp upload_request(opts) do
     Keyword.get(opts, :upload_request_fun, fn upload_url, headers, bytes ->
