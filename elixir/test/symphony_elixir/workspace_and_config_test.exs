@@ -440,6 +440,18 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute Issue.routable?(%{issue | dispatchable: false}, ["symphony"])
   end
 
+  test "tracker issue routing supports inclusive and exclusive label filters" do
+    issue = %Issue{labels: [" Alpha ", "Beta"], dispatchable: true}
+
+    assert Issue.routable?(issue, [], [], [])
+    assert Issue.routable?(issue, [], ["alpha"], [])
+    assert Issue.routable?(issue, [], ["missing", "BETA"], [])
+    refute Issue.routable?(issue, [], ["missing"], [])
+    refute Issue.routable?(issue, [], [], ["beta"])
+    refute Issue.routable?(issue, [], ["alpha"], ["BETA"])
+    refute Issue.routable?(%{issue | dispatchable: false}, [], ["alpha"], [])
+  end
+
   test "linear client normalizes blockers from inverse relations" do
     raw_issue = %{
       "id" => "issue-1",
@@ -1011,6 +1023,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.tracker.api_key == nil
     assert config.tracker.project_slug == nil
     assert config.tracker.required_labels == []
+    assert config.tracker.include_labels == []
+    assert config.tracker.exclude_labels == []
     assert config.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
     assert config.worker.max_concurrent_agents_per_host == nil
     assert config.agent.max_concurrent_agents == 10
@@ -1047,6 +1061,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     )
 
     assert Config.settings!().tracker.required_labels == ["symphony", "javascript"]
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_include_labels: [" Alpha ", "ALPHA", "Beta"],
+      tracker_exclude_labels: [" Gamma ", "GAMMA", "Delta"]
+    )
+
+    assert Config.settings!().tracker.include_labels == ["alpha", "beta"]
+    assert Config.settings!().tracker.exclude_labels == ["gamma", "delta"]
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_required_labels: [" "])
     assert Config.settings!().tracker.required_labels == [""]

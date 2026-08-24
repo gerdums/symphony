@@ -1019,6 +1019,24 @@ defmodule SymphonyElixir.CoreTest do
              AgentRunner.continue_with_issue_for_test(issue, fetcher)
   end
 
+  test "agent runner does not continue after an excluded label is added" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_exclude_labels: ["do-not-run"])
+
+    issue = %Issue{
+      id: "issue-label-exclusion",
+      identifier: "EXAMPLE-1",
+      title: "Stop after exclusion",
+      state: "In Progress",
+      labels: []
+    }
+
+    refreshed_issue = %{issue | labels: ["Do-Not-Run"]}
+    fetcher = fn ["issue-label-exclusion"] -> {:ok, [refreshed_issue]} end
+
+    assert {:done, ^refreshed_issue} =
+             AgentRunner.continue_with_issue_for_test(issue, fetcher)
+  end
+
   test "normal worker exit schedules active-state continuation retry" do
     issue_id = "issue-resume"
     ref = make_ref()

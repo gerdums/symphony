@@ -182,7 +182,14 @@ defmodule SymphonyElixir.AgentRunner do
   defp active_issue_state?(_state_name), do: false
 
   defp issue_routable?(%Issue{} = issue) do
-    Issue.routable?(issue, Config.settings!().tracker.required_labels)
+    tracker = Config.settings!().tracker
+
+    Issue.routable?(
+      issue,
+      tracker.required_labels,
+      tracker.include_labels,
+      tracker.exclude_labels
+    )
   end
 
   defp selected_worker_host(nil, []), do: nil
