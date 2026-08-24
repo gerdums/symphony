@@ -385,16 +385,17 @@ defmodule SymphonyElixir.LinearAgentTest do
 
     assert AgentBridge.session_for_issue("issue-1", bridge_name) == "session-1"
 
-    assert_received {:session_update,
-                     %{
-                       "id" => "session-1",
-                       "input" => %{
-                         "plan" => [
-                           %{"content" => "Implement", "status" => "inProgress"},
-                           %{"content" => "Validate", "status" => "pending"}
-                         ]
-                       }
-                     }}
+    assert_receive {:session_update,
+                    %{
+                      "id" => "session-1",
+                      "input" => %{
+                        "plan" => [
+                          %{"content" => "Implement", "status" => "inProgress"},
+                          %{"content" => "Validate", "status" => "pending"}
+                        ]
+                      }
+                    }},
+                   1_000
 
     assert {:error, :proof_required} = AgentBridge.complete("issue-1", "Done", bridge_name)
 
@@ -513,7 +514,7 @@ defmodule SymphonyElixir.LinearAgentTest do
     assert :ok = AgentBridge.start_work(%Issue{id: "issue-1"}, bridge_name)
 
     assert_received {:assignment_request, %{"issueId" => "issue-1", "delegateId" => "app-user"}}
-    assert_received {:session_update, %{"id" => "session-1", "input" => %{"plan" => [plan]}}}
+    assert_receive {:session_update, %{"id" => "session-1", "input" => %{"plan" => [plan]}}}, 1_000
     assert plan["content"] == "Preparing the ticket workspace"
   end
 
@@ -580,11 +581,12 @@ defmodule SymphonyElixir.LinearAgentTest do
     assert :ok = AgentBridge.waiting_for_slot(issue, bridge_name)
     assert AgentBridge.session_for_issue(issue.id, bridge_name) == "session-waiting"
 
-    assert_received {:session_update,
-                     %{
-                       "id" => "session-waiting",
-                       "input" => %{"plan" => [%{"content" => waiting_text}]}
-                     }}
+    assert_receive {:session_update,
+                    %{
+                      "id" => "session-waiting",
+                      "input" => %{"plan" => [%{"content" => waiting_text}]}
+                    }},
+                   1_000
 
     assert waiting_text =~ "Waiting for an available worker slot"
 
@@ -596,15 +598,100 @@ defmodule SymphonyElixir.LinearAgentTest do
 
     assert :ok = AgentBridge.start_work(issue, bridge_name)
 
-    assert_received {:session_update,
-                     %{
-                       "id" => "session-waiting",
-                       "input" => %{
-                         "plan" => [
-                           %{"content" => "Preparing the ticket workspace", "status" => "inProgress"}
-                         ]
+    assert_receive {:session_update,
+                    %{
+                      "id" => "session-waiting",
+                      "input" => %{
+                        "plan" => [
+                          %{"content" => "Preparing the ticket workspace", "status" => "inProgress"}
+                        ]
+                      }
+                    }},
+                   1_000
+  end
+
+  test "waiting session provisioning does not block bridge state reads" do
+    test_pid = self()
+
+    request_fun = fn payload, _headers ->
+      cond do
+        payload["query"] =~ "SymphonyFindAgentSession" ->
+          send(test_pid, {:session_lookup_started, self()})
+
+          receive do
+            :continue_session_lookup -> :ok
+          end
+
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "data" => %{
+                 "issue" => %{
+                   "agentSessions" => %{
+                     "nodes" => [
+                       %{
+                         "id" => "session-async",
+                         "status" => "active",
+                         "appUser" => %{"id" => "app-user"}
                        }
-                     }}
+                     ]
+                   }
+                 }
+               }
+             }
+           }}
+
+        payload["query"] =~ "SymphonyUpdateAgentSession" ->
+          send(test_pid, {:session_update, payload["variables"]})
+
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "data" => %{
+                 "agentSessionUpdate" => %{
+                   "success" => true,
+                   "agentSession" => %{"id" => "session-async"}
+                 }
+               }
+             }
+           }}
+
+        payload["query"] =~ "SymphonyCreateAgentActivity" ->
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "data" => %{
+                 "agentActivityCreate" => %{
+                   "success" => true,
+                   "agentActivity" => %{"id" => "activity-async"}
+                 }
+               }
+             }
+           }}
+
+        true ->
+          flunk("unexpected GraphQL operation")
+      end
+    end
+
+    bridge_name = String.to_atom("linear_agent_async_waiting_bridge_#{System.unique_integer([:positive])}")
+
+    start_supervised!({AgentBridge, name: bridge_name, orchestrator: nil, client_opts: [request_fun: request_fun]})
+
+    issue = %Issue{id: "issue-async"}
+    assert :ok = AgentBridge.waiting_for_slot(issue, bridge_name)
+    assert_receive {:session_lookup_started, lookup_pid}, 1_000
+
+    assert AgentBridge.session_for_issue(issue.id, bridge_name) == nil
+    assert :ok = AgentBridge.waiting_for_slot(issue, bridge_name)
+    refute_receive {:session_lookup_started, _pid}, 50
+
+    send(lookup_pid, :continue_session_lookup)
+    assert_receive {:session_update, %{"id" => "session-async"}}, 1_000
+    assert AgentBridge.session_for_issue(issue.id, bridge_name) == "session-async"
   end
 
   test "bridge publishes only one stop notification while a failed ticket retries" do

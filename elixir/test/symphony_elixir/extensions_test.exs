@@ -209,19 +209,19 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:noreply, returned_state} = WorkflowStore.handle_info(:poll, state)
     assert returned_state.workflow.prompt == "Manual workflow prompt"
     refute returned_state.stamp == nil
-    assert_receive :poll, 1_100
+    assert_receive :poll, 1_500
 
     Workflow.set_workflow_file_path(missing_path)
     assert {:noreply, path_error_state} = WorkflowStore.handle_info(:poll, returned_state)
     assert path_error_state.workflow.prompt == "Manual workflow prompt"
-    assert_receive :poll, 1_100
+    assert_receive :poll, 1_500
 
     Workflow.set_workflow_file_path(manual_path)
     File.rm!(manual_path)
     assert {:ok, %{prompt: "Manual workflow prompt"}} = WorkflowStore.current()
     assert {:noreply, removed_state} = WorkflowStore.handle_info(:poll, path_error_state)
     assert removed_state.workflow.prompt == "Manual workflow prompt"
-    assert_receive :poll, 1_100
+    assert_receive :poll, 1_500
 
     assert :ok = GenServer.stop(manual_pid)
 

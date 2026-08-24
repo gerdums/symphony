@@ -308,6 +308,10 @@ or coding from starting. A queued ticket remains undelegated until capacity is a
 Repeated failures for one ticket produce at most one native stop/error notification while Symphony
 keeps the session and retry state attached.
 
+Waiting-session provisioning and progress/activity delivery run asynchronously from the bridge's
+state loop. A slow Linear request therefore does not block admitted workers from starting or prevent
+an active worker from consuming a follow-up prompt.
+
 ### Linear adapter profile
 
 - Config: use `tracker.kind: linear` with `tracker.provider.endpoint` (default

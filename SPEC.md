@@ -2372,6 +2372,8 @@ the workflow.
   enabled, delegation to the app user MUST succeed before setup or coding work begins.
 - Repeated failures for one ticket SHOULD be coalesced so a retry loop does not emit duplicate native
   stop/error notifications while the same session remains active.
+- Waiting-session provisioning and progress/activity publication MUST run outside the bridge's
+  serialized state loop so slow Linear network calls cannot starve worker startup or live prompts.
 - The webhook endpoint MUST verify `Linear-Signature` against the raw body using HMAC-SHA256 and
   SHOULD reject stale `webhookTimestamp` values.
 - A `created` event SHOULD register the supplied session and queue its `promptContext`.
