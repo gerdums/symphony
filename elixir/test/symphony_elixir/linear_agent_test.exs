@@ -274,59 +274,67 @@ defmodule SymphonyElixir.LinearAgentTest do
     test_pid = self()
 
     request_fun = fn payload, _headers ->
-      send(test_pid, {:session_page, payload["variables"]["after"]})
+      if payload["query"] =~ "SymphonyFindAgentProject" do
+        {:ok,
+         %{
+           status: 200,
+           body: %{"data" => %{"projects" => %{"nodes" => [%{"id" => "project-id"}]}}}
+         }}
+      else
+        send(test_pid, {:session_page, payload["variables"]["after"]})
 
-      nodes =
-        case payload["variables"]["after"] do
-          nil ->
-            [
-              %{
-                "id" => "session-page-1",
-                "status" => "active",
-                "appUser" => %{"id" => "app-user"},
-                "issue" => %{"id" => "issue-1", "project" => %{"slugId" => "project"}}
-              },
-              %{
-                "id" => "other-project",
-                "status" => "active",
-                "appUser" => %{"id" => "app-user"},
-                "issue" => %{"id" => "issue-other", "project" => %{"slugId" => "other"}}
-              }
-            ]
+        nodes =
+          case payload["variables"]["after"] do
+            nil ->
+              [
+                %{
+                  "id" => "session-page-1",
+                  "status" => "active",
+                  "appUser" => %{"id" => "app-user"},
+                  "issue" => %{"id" => "issue-1", "project" => %{"id" => "project-id"}}
+                },
+                %{
+                  "id" => "other-project",
+                  "status" => "active",
+                  "appUser" => %{"id" => "app-user"},
+                  "issue" => %{"id" => "issue-other", "project" => %{"id" => "other"}}
+                }
+              ]
 
-          "next-page" ->
-            [
-              %{
-                "id" => "session-page-2",
-                "status" => "active",
-                "appUser" => %{"id" => "app-user"},
-                "issue" => %{"id" => "issue-2", "project" => %{"slugId" => "project"}}
-              },
-              %{
-                "id" => "completed-session",
-                "status" => "complete",
-                "appUser" => %{"id" => "app-user"},
-                "issue" => %{"id" => "issue-complete", "project" => %{"slugId" => "project"}}
-              }
-            ]
-        end
+            "next-page" ->
+              [
+                %{
+                  "id" => "session-page-2",
+                  "status" => "active",
+                  "appUser" => %{"id" => "app-user"},
+                  "issue" => %{"id" => "issue-2", "project" => %{"id" => "project-id"}}
+                },
+                %{
+                  "id" => "completed-session",
+                  "status" => "complete",
+                  "appUser" => %{"id" => "app-user"},
+                  "issue" => %{"id" => "issue-complete", "project" => %{"id" => "project-id"}}
+                }
+              ]
+          end
 
-      page_info =
-        if is_nil(payload["variables"]["after"]) do
-          %{"hasNextPage" => true, "endCursor" => "next-page"}
-        else
-          %{"hasNextPage" => false, "endCursor" => nil}
-        end
+        page_info =
+          if is_nil(payload["variables"]["after"]) do
+            %{"hasNextPage" => true, "endCursor" => "next-page"}
+          else
+            %{"hasNextPage" => false, "endCursor" => nil}
+          end
 
-      {:ok,
-       %{
-         status: 200,
-         body: %{
-           "data" => %{
-             "agentSessions" => %{"nodes" => nodes, "pageInfo" => page_info}
+        {:ok,
+         %{
+           status: 200,
+           body: %{
+             "data" => %{
+               "agentSessions" => %{"nodes" => nodes, "pageInfo" => page_info}
+             }
            }
-         }
-       }}
+         }}
+      end
     end
 
     assert {:ok, sessions} =
@@ -341,20 +349,28 @@ defmodule SymphonyElixir.LinearAgentTest do
     test_pid = self()
 
     request_fun = fn payload, _headers ->
-      send(test_pid, {:archived_session_query, payload["query"]})
+      if payload["query"] =~ "SymphonyFindAgentProject" do
+        {:ok,
+         %{
+           status: 200,
+           body: %{"data" => %{"projects" => %{"nodes" => [%{"id" => "project-id"}]}}}
+         }}
+      else
+        send(test_pid, {:archived_session_query, payload["query"]})
 
-      {:ok,
-       %{
-         status: 200,
-         body: %{
-           "data" => %{
-             "agentSessions" => %{
-               "nodes" => [],
-               "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+        {:ok,
+         %{
+           status: 200,
+           body: %{
+             "data" => %{
+               "agentSessions" => %{
+                 "nodes" => [],
+                 "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+               }
              }
            }
-         }
-       }}
+         }}
+      end
     end
 
     assert {:ok, []} =
@@ -1004,6 +1020,13 @@ defmodule SymphonyElixir.LinearAgentTest do
 
     request_fun = fn payload, _headers ->
       cond do
+        payload["query"] =~ "SymphonyFindAgentProject" ->
+          {:ok,
+           %{
+             status: 200,
+             body: %{"data" => %{"projects" => %{"nodes" => [%{"id" => "project-id"}]}}}
+           }}
+
         payload["query"] =~ "SymphonyListAgentSessions" ->
           send(test_pid, :open_session_reconciliation)
 
@@ -1020,7 +1043,7 @@ defmodule SymphonyElixir.LinearAgentTest do
                        "appUser" => %{"id" => "app-user"},
                        "issue" => %{
                          "id" => "issue-eligible",
-                         "project" => %{"slugId" => "project"}
+                         "project" => %{"id" => "project-id"}
                        }
                      },
                      %{
@@ -1029,7 +1052,7 @@ defmodule SymphonyElixir.LinearAgentTest do
                        "appUser" => %{"id" => "app-user"},
                        "issue" => %{
                          "id" => "issue-orphaned",
-                         "project" => %{"slugId" => "project"}
+                         "project" => %{"id" => "project-id"}
                        }
                      }
                    ],

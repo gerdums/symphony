@@ -37,13 +37,20 @@ defmodule SymphonyElixir.Linear.AgentClient do
         appUser { id }
         issue {
           id
-          project { slugId }
+          project { id }
         }
       }
       pageInfo {
         hasNextPage
         endCursor
       }
+    }
+  }
+  """
+  @project_by_slug_query """
+  query SymphonyFindAgentProject($projectSlug: String!) {
+    projects(filter: {slugId: {eq: $projectSlug}}, first: 2) {
+      nodes { id }
     }
   }
   """
@@ -122,7 +129,9 @@ defmodule SymphonyElixir.Linear.AgentClient do
           {:ok, [map()]} | {:error, term()}
   def list_open_sessions(app_user_id, project_slug, opts \\ [])
       when is_binary(app_user_id) and is_binary(project_slug) do
-    list_open_sessions_page(app_user_id, project_slug, nil, [], opts)
+    with {:ok, project_id} <- resolve_project_id(project_slug, opts) do
+      list_open_sessions_page(app_user_id, project_id, nil, [], opts)
+    end
   end
 
   @spec create_activity(String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -267,7 +276,18 @@ defmodule SymphonyElixir.Linear.AgentClient do
     end
   end
 
-  defp list_open_sessions_page(app_user_id, project_slug, after_cursor, acc, opts) do
+  defp resolve_project_id(project_slug, opts) do
+    with {:ok, body} <- graphql(@project_by_slug_query, %{"projectSlug" => project_slug}, opts) do
+      case get_in(body, ["data", "projects", "nodes"]) do
+        [%{"id" => project_id}] when is_binary(project_id) -> {:ok, project_id}
+        [] -> {:error, :linear_agent_project_not_found}
+        nodes when is_list(nodes) -> {:error, {:linear_agent_ambiguous_project, length(nodes)}}
+        other -> {:error, {:linear_agent_unknown_payload, other}}
+      end
+    end
+  end
+
+  defp list_open_sessions_page(app_user_id, project_id, after_cursor, acc, opts) do
     variables = %{"first" => @session_page_size, "after" => after_cursor}
 
     with {:ok, body} <- graphql(@list_sessions_query, variables, opts),
@@ -276,7 +296,7 @@ defmodule SymphonyElixir.Linear.AgentClient do
       matching_sessions =
         Enum.filter(nodes, fn session ->
           open_session_for_app?(session, app_user_id) and
-            get_in(session, ["issue", "project", "slugId"]) == project_slug and
+            get_in(session, ["issue", "project", "id"]) == project_id and
             is_binary(get_in(session, ["issue", "id"]))
         end)
 
@@ -284,7 +304,7 @@ defmodule SymphonyElixir.Linear.AgentClient do
 
       case page_info do
         %{"hasNextPage" => true, "endCursor" => end_cursor} when is_binary(end_cursor) ->
-          list_open_sessions_page(app_user_id, project_slug, end_cursor, updated_acc, opts)
+          list_open_sessions_page(app_user_id, project_id, end_cursor, updated_acc, opts)
 
         _ ->
           {:ok, updated_acc}
