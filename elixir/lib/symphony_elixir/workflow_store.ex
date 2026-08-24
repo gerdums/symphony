@@ -1,6 +1,9 @@
 defmodule SymphonyElixir.WorkflowStore do
   @moduledoc """
   Caches the last known good workflow and reloads it when `WORKFLOW.md` changes.
+
+  Runtime readers use an ETS snapshot so orchestration and observability do not
+  depend on the reload process mailbox remaining responsive under load.
   """
 
   use GenServer
@@ -11,6 +14,8 @@ defmodule SymphonyElixir.WorkflowStore do
   alias SymphonyElixir.Workflow
 
   @poll_interval_ms 1_000
+  @cache_table __MODULE__.Cache
+  @cache_key :state
 
   defmodule State do
     @moduledoc false
@@ -27,7 +32,11 @@ defmodule SymphonyElixir.WorkflowStore do
   def current do
     case Process.whereis(__MODULE__) do
       pid when is_pid(pid) ->
-        GenServer.call(__MODULE__, :current)
+        state = cached_state()
+
+        if cache_current?(state),
+          do: {:ok, state.workflow},
+          else: GenServer.call(__MODULE__, :current)
 
       _ ->
         Workflow.load()
@@ -38,7 +47,11 @@ defmodule SymphonyElixir.WorkflowStore do
   def settings do
     case Process.whereis(__MODULE__) do
       pid when is_pid(pid) ->
-        GenServer.call(__MODULE__, :settings)
+        state = cached_state()
+
+        if cache_current?(state),
+          do: {:ok, state.settings},
+          else: GenServer.call(__MODULE__, :settings)
 
       _ ->
         case load_state(Workflow.workflow_file_path()) do
@@ -66,6 +79,7 @@ defmodule SymphonyElixir.WorkflowStore do
   def init(_opts) do
     case load_state(Workflow.workflow_file_path()) do
       {:ok, state} ->
+        initialize_cache(state)
         schedule_poll()
         {:ok, state}
 
@@ -78,6 +92,7 @@ defmodule SymphonyElixir.WorkflowStore do
   def handle_call(:current, _from, %State{} = state) do
     case reload_state(state) do
       {:ok, new_state} ->
+        cache_state(new_state)
         {:reply, {:ok, new_state.workflow}, new_state}
 
       {:error, _reason, new_state} ->
@@ -88,6 +103,7 @@ defmodule SymphonyElixir.WorkflowStore do
   def handle_call(:force_reload, _from, %State{} = state) do
     case reload_state(state) do
       {:ok, new_state} ->
+        cache_state(new_state)
         {:reply, :ok, new_state}
 
       {:error, reason, new_state} ->
@@ -98,6 +114,7 @@ defmodule SymphonyElixir.WorkflowStore do
   def handle_call(:settings, _from, %State{} = state) do
     case reload_state(state) do
       {:ok, new_state} ->
+        cache_state(new_state)
         {:reply, {:ok, new_state.settings}, new_state}
 
       {:error, _reason, new_state} ->
@@ -110,8 +127,41 @@ defmodule SymphonyElixir.WorkflowStore do
     schedule_poll()
 
     case reload_state(state) do
-      {:ok, new_state} -> {:noreply, new_state}
-      {:error, _reason, new_state} -> {:noreply, new_state}
+      {:ok, new_state} ->
+        cache_state(new_state)
+        {:noreply, new_state}
+
+      {:error, _reason, new_state} ->
+        {:noreply, new_state}
+    end
+  end
+
+  defp initialize_cache(state) do
+    :ets.new(@cache_table, [
+      :named_table,
+      :protected,
+      read_concurrency: true
+    ])
+
+    cache_state(state)
+  end
+
+  defp cache_state(%State{} = state) do
+    true = :ets.insert(@cache_table, {@cache_key, state})
+    :ok
+  end
+
+  defp cached_state do
+    [{@cache_key, %State{} = state}] = :ets.lookup(@cache_table, @cache_key)
+    state
+  end
+
+  defp cache_current?(%State{} = state) do
+    path = Workflow.workflow_file_path()
+
+    case current_stamp(path) do
+      {:ok, stamp} -> path == state.path and stamp == state.stamp
+      {:error, _reason} -> false
     end
   end
 

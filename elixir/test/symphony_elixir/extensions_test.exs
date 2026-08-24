@@ -92,6 +92,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       poll_interval_ms: 45_000
     )
 
+    assert {:ok, %{prompt: "Second prompt"}} = Workflow.current()
     send(WorkflowStore, :poll)
 
     assert_eventually(fn ->
@@ -141,6 +142,39 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
   end
 
+  test "workflow reads stay available while the reload process is busy" do
+    ensure_workflow_store_running()
+    expected_settings = Config.settings!()
+    assert {:ok, expected_workflow} = Workflow.current()
+
+    :sys.suspend(WorkflowStore)
+
+    try do
+      assert {:ok, ^expected_settings} = WorkflowStore.settings()
+      assert {:ok, ^expected_workflow} = WorkflowStore.current()
+    after
+      :sys.resume(WorkflowStore)
+    end
+  end
+
+  test "workflow reads refresh a changed file immediately" do
+    ensure_workflow_store_running()
+    path = Workflow.workflow_file_path()
+
+    updated_workflow =
+      path
+      |> File.read!()
+      |> String.replace(
+        "You are an agent for this repository.",
+        "You are an agent for this repository, reloaded."
+      )
+
+    File.write!(path, updated_workflow)
+
+    assert {:ok, %{prompt: "You are an agent for this repository, reloaded."}} =
+             WorkflowStore.current()
+  end
+
   test "workflow store init stops on missing workflow file" do
     missing_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "MISSING_WORKFLOW.md")
     Workflow.set_workflow_file_path(missing_path)
@@ -184,6 +218,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     Workflow.set_workflow_file_path(manual_path)
     File.rm!(manual_path)
+    assert {:ok, %{prompt: "Manual workflow prompt"}} = WorkflowStore.current()
     assert {:noreply, removed_state} = WorkflowStore.handle_info(:poll, path_error_state)
     assert removed_state.workflow.prompt == "Manual workflow prompt"
     assert_receive :poll, 1_100
