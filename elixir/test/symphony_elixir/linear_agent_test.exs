@@ -2,6 +2,7 @@ defmodule SymphonyElixir.LinearAgentTest do
   use SymphonyElixir.TestSupport
 
   alias SymphonyElixir.Codex.DynamicTool
+  alias SymphonyElixir.Tracker.Issue
 
   alias SymphonyElixir.Linear.{
     AgentBridge,
@@ -51,6 +52,33 @@ defmodule SymphonyElixir.LinearAgentTest do
     assert payload["variables"]["input"]["issueId"] == "issue-1"
 
     refute Map.has_key?(payload["variables"]["input"], "externalUrls")
+  end
+
+  test "agent client assigns an issue to the OAuth app user" do
+    test_pid = self()
+
+    request_fun = fn payload, _headers ->
+      send(test_pid, {:assignment_request, payload})
+
+      {:ok,
+       %{
+         status: 200,
+         body: %{
+           "data" => %{
+             "issueUpdate" => %{
+               "success" => true,
+               "issue" => %{"id" => "issue-1", "assignee" => %{"id" => "app-user"}}
+             }
+           }
+         }
+       }}
+    end
+
+    assert {:ok, %{"assignee" => %{"id" => "app-user"}}} =
+             AgentClient.assign_issue("issue-1", "app-user", request_fun: request_fun)
+
+    assert_received {:assignment_request, payload}
+    assert payload["variables"] == %{"issueId" => "issue-1", "assigneeId" => "app-user"}
   end
 
   test "enabled config advertises proof and keeps all agent secrets out of the child environment" do
@@ -149,26 +177,32 @@ defmodule SymphonyElixir.LinearAgentTest do
   test "host-private environment can enable local plus remote worker routing" do
     previous_hosts = System.get_env("SYMPHONY_WORKER_SSH_HOSTS")
     previous_local = System.get_env("SYMPHONY_WORKER_INCLUDE_LOCAL")
+    previous_assignment = System.get_env("SYMPHONY_LINEAR_AGENT_ASSIGN_ON_START")
 
     on_exit(fn ->
       restore_env("SYMPHONY_WORKER_SSH_HOSTS", previous_hosts)
       restore_env("SYMPHONY_WORKER_INCLUDE_LOCAL", previous_local)
+      restore_env("SYMPHONY_LINEAR_AGENT_ASSIGN_ON_START", previous_assignment)
     end)
 
     System.put_env("SYMPHONY_WORKER_SSH_HOSTS", "remote-one, remote-two")
     System.put_env("SYMPHONY_WORKER_INCLUDE_LOCAL", "true")
+    System.put_env("SYMPHONY_LINEAR_AGENT_ASSIGN_ON_START", "true")
     write_workflow_file!(Workflow.workflow_file_path())
 
     assert Config.settings!().worker.ssh_hosts == ["remote-one", "remote-two"]
     assert Config.settings!().worker.include_local
+    assert Config.settings!().linear_agent.assign_on_start
 
     System.put_env("SYMPHONY_WORKER_INCLUDE_LOCAL", "false")
     write_workflow_file!(Workflow.workflow_file_path(), worker_include_local: true)
     refute Config.settings!().worker.include_local
 
     System.put_env("SYMPHONY_WORKER_INCLUDE_LOCAL", "not-a-boolean")
+    System.put_env("SYMPHONY_LINEAR_AGENT_ASSIGN_ON_START", "not-a-boolean")
     write_workflow_file!(Workflow.workflow_file_path())
     refute Config.settings!().worker.include_local
+    refute Config.settings!().linear_agent.assign_on_start
   end
 
   test "agent client recovers the app's open issue session after a restart" do
@@ -393,6 +427,76 @@ defmodule SymphonyElixir.LinearAgentTest do
                      }}
 
     assert_received {:activity, %{"content" => %{"type" => "response", "body" => "Done"}}}
+  end
+
+  test "bridge takes assignment only when work is ready to start" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      linear_agent_enabled: true,
+      linear_agent_assign_on_start: true,
+      linear_agent_access_token: "oauth-token",
+      linear_agent_webhook_secret: "webhook-secret",
+      linear_agent_oauth_client_id: "oauth-client",
+      linear_agent_app_user_id: "app-user"
+    )
+
+    test_pid = self()
+
+    request_fun = fn payload, _headers ->
+      cond do
+        payload["query"] =~ "SymphonyCreateAgentActivity" ->
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "data" => %{
+                 "agentActivityCreate" => %{
+                   "success" => true,
+                   "agentActivity" => %{"id" => "activity-1"}
+                 }
+               }
+             }
+           }}
+
+        payload["query"] =~ "SymphonyAssignIssue" ->
+          send(test_pid, {:assignment_request, payload["variables"]})
+
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "data" => %{
+                 "issueUpdate" => %{
+                   "success" => true,
+                   "issue" => %{"id" => "issue-1", "assignee" => %{"id" => "app-user"}}
+                 }
+               }
+             }
+           }}
+
+        true ->
+          flunk("unexpected GraphQL operation")
+      end
+    end
+
+    bridge_name = String.to_atom("linear_agent_assignment_bridge_#{System.unique_integer([:positive])}")
+    start_supervised!({AgentBridge, name: bridge_name, orchestrator: nil, client_opts: [request_fun: request_fun]})
+
+    assert :ok =
+             AgentBridge.accept_webhook(
+               %{
+                 "action" => "created",
+                 "webhookId" => "assignment-webhook",
+                 "oauthClientId" => "oauth-client",
+                 "appUserId" => "app-user",
+                 "agentSession" => %{"id" => "session-1", "issueId" => "issue-1"}
+               },
+               bridge_name
+             )
+
+    assert AgentBridge.session_for_issue("issue-1", bridge_name) == "session-1"
+    assert :ok = AgentBridge.start_work(%Issue{id: "issue-1"}, bridge_name)
+
+    assert_received {:assignment_request, %{"issueId" => "issue-1", "assigneeId" => "app-user"}}
   end
 
   test "proof tool only uploads an image contained in the current workspace" do

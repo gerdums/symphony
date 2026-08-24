@@ -44,6 +44,14 @@ defmodule SymphonyElixir.Linear.AgentClient do
     }
   }
   """
+  @assign_issue_mutation """
+  mutation SymphonyAssignIssue($issueId: String!, $assigneeId: String!) {
+    issueUpdate(id: $issueId, input: {assigneeId: $assigneeId}) {
+      success
+      issue { id assignee { id } }
+    }
+  }
+  """
   @file_upload_mutation """
   mutation SymphonyPrepareProofUpload($filename: String!, $contentType: String!, $size: Int!) {
     fileUpload(filename: $filename, contentType: $contentType, size: $size, makePublic: false) {
@@ -105,6 +113,16 @@ defmodule SymphonyElixir.Linear.AgentClient do
              opts
            ) do
       get_graphql_data(body, ["agentSessionUpdate", "agentSession"])
+    end
+  end
+
+  @spec assign_issue(String.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def assign_issue(issue_id, assignee_id, opts \\ [])
+      when is_binary(issue_id) and is_binary(assignee_id) do
+    variables = %{"issueId" => issue_id, "assigneeId" => assignee_id}
+
+    with {:ok, body} <- graphql(@assign_issue_mutation, variables, opts) do
+      get_graphql_data(body, ["issueUpdate", "issue"])
     end
   end
 

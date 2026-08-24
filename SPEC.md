@@ -2323,6 +2323,8 @@ the execution coordinator.
 Extension config:
 
 - `linear_agent.enabled` (boolean, default `false`)
+- `linear_agent.assign_on_start` (boolean, default `false`; assign the issue to the configured app
+  user after workspace preparation succeeds and before the coding-agent session starts)
   - `SYMPHONY_LINEAR_AGENT_ENABLED` MAY override this in host-private deployment configuration.
 - `linear_agent.display_name` (string or `$VAR`, default `Symphony Agent`)
 - `linear_agent.endpoint` (URL, default `https://api.linear.app/graphql`)

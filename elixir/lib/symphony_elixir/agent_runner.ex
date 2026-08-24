@@ -45,7 +45,8 @@ defmodule SymphonyElixir.AgentRunner do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
     with {:ok, _session_id} <- ensure_linear_agent_session(issue),
-         {:ok, workspace} <- Workspace.create_for_issue(issue, worker_host) do
+         {:ok, workspace} <- Workspace.create_for_issue(issue, worker_host),
+         :ok <- start_linear_agent_work(issue) do
       send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
       try do
@@ -66,6 +67,14 @@ defmodule SymphonyElixir.AgentRunner do
       :disabled -> {:ok, nil}
       {:ok, session_id} -> {:ok, session_id}
       {:error, reason} -> {:error, {:linear_agent_session_failed, reason}}
+    end
+  end
+
+  defp start_linear_agent_work(issue) do
+    case AgentBridge.start_work(issue) do
+      :disabled -> :ok
+      :ok -> :ok
+      {:error, reason} -> {:error, {:linear_agent_assignment_failed, reason}}
     end
   end
 

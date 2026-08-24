@@ -107,6 +107,7 @@ defmodule SymphonyElixir.TestSupport do
           worker_include_local: false,
           worker_max_concurrent_agents_per_host: nil,
           linear_agent_enabled: false,
+          linear_agent_assign_on_start: false,
           linear_agent_display_name: "Symphony Agent",
           linear_agent_endpoint: "https://api.linear.app/graphql",
           linear_agent_token_endpoint: "https://api.linear.app/oauth/token",
@@ -162,6 +163,7 @@ defmodule SymphonyElixir.TestSupport do
     worker_include_local = Keyword.get(config, :worker_include_local)
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
     linear_agent_enabled = Keyword.get(config, :linear_agent_enabled)
+    linear_agent_assign_on_start = Keyword.get(config, :linear_agent_assign_on_start)
     linear_agent_display_name = Keyword.get(config, :linear_agent_display_name)
     linear_agent_endpoint = Keyword.get(config, :linear_agent_endpoint)
     linear_agent_token_endpoint = Keyword.get(config, :linear_agent_token_endpoint)
@@ -219,6 +221,7 @@ defmodule SymphonyElixir.TestSupport do
         worker_yaml(worker_ssh_hosts, worker_include_local, worker_max_concurrent_agents_per_host),
         linear_agent_yaml(%{
           enabled: linear_agent_enabled,
+          assign_on_start: linear_agent_assign_on_start,
           display_name: linear_agent_display_name,
           endpoint: linear_agent_endpoint,
           token_endpoint: linear_agent_token_endpoint,
@@ -324,6 +327,7 @@ defmodule SymphonyElixir.TestSupport do
     [
       "linear_agent:",
       "  enabled: #{yaml_value(config.enabled)}",
+      "  assign_on_start: #{yaml_value(config.assign_on_start)}",
       "  display_name: #{yaml_value(config.display_name)}",
       "  endpoint: #{yaml_value(config.endpoint)}",
       "  token_endpoint: #{yaml_value(config.token_endpoint)}",
