@@ -42,6 +42,11 @@ defmodule SymphonyElixir.Linear.AgentBridge do
     GenServer.call(server, {:ensure_session, issue}, 35_000)
   end
 
+  @spec start_work(Issue.t(), GenServer.server()) :: :ok | {:error, term()} | :disabled
+  def start_work(%Issue{} = issue, server \\ __MODULE__) do
+    GenServer.call(server, {:start_work, issue}, 35_000)
+  end
+
   @spec session_for_issue(String.t(), GenServer.server()) :: String.t() | nil
   def session_for_issue(issue_id, server \\ __MODULE__) when is_binary(issue_id) do
     GenServer.call(server, {:session_for_issue, issue_id})
@@ -134,6 +139,25 @@ defmodule SymphonyElixir.Linear.AgentBridge do
           other ->
             {:reply, {:error, {:invalid_agent_session_response, other}}, state}
         end
+    end
+  end
+
+  def handle_call({:start_work, %Issue{id: issue_id}}, _from, state) do
+    settings = Config.settings!().linear_agent
+
+    cond do
+      !settings.enabled ->
+        {:reply, :disabled, state}
+
+      !settings.assign_on_start ->
+        {:reply, :ok, state}
+
+      is_nil(session_id(state, issue_id)) ->
+        {:reply, {:error, :missing_linear_agent_session}, state}
+
+      true ->
+        result = assign_issue_to_app(state, issue_id, settings.app_user_id)
+        {:reply, result, state}
     end
   end
 
@@ -454,6 +478,19 @@ defmodule SymphonyElixir.Linear.AgentBridge do
       {:ok, %{} = session} -> {:ok, session}
       :not_found -> state.client.create_session(issue_id, client_opts(state))
       {:error, reason} -> {:error, {:linear_agent_session_lookup_failed, reason}}
+    end
+  end
+
+  defp assign_issue_to_app(state, issue_id, app_user_id) do
+    case state.client.assign_issue(issue_id, app_user_id, client_opts(state)) do
+      {:ok, %{"assignee" => %{"id" => ^app_user_id}}} ->
+        :ok
+
+      {:ok, issue} ->
+        {:error, {:linear_agent_assignment_not_applied, issue}}
+
+      {:error, reason} ->
+        {:error, {:linear_agent_assignment_failed, reason}}
     end
   end
 

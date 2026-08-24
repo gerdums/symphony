@@ -180,6 +180,7 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:enabled, :boolean, default: false)
+      field(:assign_on_start, :boolean, default: false)
       field(:display_name, :string, default: "Symphony Agent")
       field(:endpoint, :string, default: "https://api.linear.app/graphql")
       field(:token_endpoint, :string, default: "https://api.linear.app/oauth/token")
@@ -201,6 +202,7 @@ defmodule SymphonyElixir.Config.Schema do
         attrs,
         [
           :enabled,
+          :assign_on_start,
           :display_name,
           :endpoint,
           :token_endpoint,
@@ -580,6 +582,11 @@ defmodule SymphonyElixir.Config.Schema do
           resolve_boolean_setting(
             System.get_env("SYMPHONY_LINEAR_AGENT_ENABLED"),
             linear_agent.enabled
+          ),
+        assign_on_start:
+          resolve_boolean_setting(
+            System.get_env("SYMPHONY_LINEAR_AGENT_ASSIGN_ON_START"),
+            linear_agent.assign_on_start
           ),
         display_name: display_name,
         access_token: access_token,

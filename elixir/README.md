@@ -225,6 +225,7 @@ workflow should contain only environment references:
 ```yaml
 linear_agent:
   enabled: true
+  assign_on_start: true
   display_name: $LINEAR_AGENT_DISPLAY_NAME
   token_endpoint: https://api.linear.app/oauth/token
   client_secret: $LINEAR_AGENT_CLIENT_SECRET
@@ -277,6 +278,7 @@ Host-private launchers may enable the same settings without modifying a repo-own
 
 ```bash
 export SYMPHONY_LINEAR_AGENT_ENABLED=true
+export SYMPHONY_LINEAR_AGENT_ASSIGN_ON_START=true
 export SYMPHONY_WORKER_INCLUDE_LOCAL=true
 export SYMPHONY_WORKER_SSH_HOSTS=worker.example
 ```
@@ -284,6 +286,11 @@ export SYMPHONY_WORKER_SSH_HOSTS=worker.example
 `SYMPHONY_WORKER_SSH_HOSTS` is a comma-separated list. The two worker-routing environment variables
 are also stripped from the local Codex child environment so host topology does not leak through an
 inherited shell environment.
+
+When `linear_agent.assign_on_start` (or `SYMPHONY_LINEAR_AGENT_ASSIGN_ON_START`) is true, Symphony
+assigns the issue to the OAuth app user after workspace preparation succeeds and before Codex starts.
+Assignment failure prevents the coding turn from starting, so an app cannot work a ticket while the
+issue still appears assigned elsewhere.
 
 ### Linear adapter profile
 
