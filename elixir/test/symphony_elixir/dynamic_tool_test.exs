@@ -98,6 +98,50 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert response["contentItems"] == [%{"type" => "inputText", "text" => response["output"]}]
   end
 
+  test "linear_graphql uses the native app OAuth identity when agent sessions are enabled" do
+    test_pid = self()
+    agent_settings = %{enabled: true, endpoint: "https://api.linear.app/graphql"}
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "query Viewer { viewer { id } }"},
+        linear_agent_settings: agent_settings,
+        linear_agent_client: fn query, variables, opts ->
+          send(test_pid, {:linear_agent_client_called, query, variables, opts})
+          {:ok, %{"data" => %{"viewer" => %{"id" => "app_user_123"}}}}
+        end,
+        tracker_linear_client: fn _query, _variables, _opts ->
+          flunk("tracker credential must not be used for a native agent tool call")
+        end
+      )
+
+    assert_received {:linear_agent_client_called, "query Viewer { viewer { id } }", %{}, [agent_settings: ^agent_settings]}
+
+    assert response["success"] == true
+  end
+
+  test "linear_graphql keeps tracker auth when native agent sessions are disabled" do
+    test_pid = self()
+    tracker_settings = %{api_key: "tracker-token"}
+
+    response =
+      DynamicTool.execute(
+        "linear_graphql",
+        %{"query" => "query Viewer { viewer { id } }"},
+        linear_agent_settings: %{enabled: false},
+        tracker_settings: tracker_settings,
+        tracker_linear_client: fn query, variables, opts ->
+          send(test_pid, {:tracker_linear_client_called, query, variables, opts})
+          {:ok, %{"data" => %{"viewer" => %{"id" => "tracker_user_123"}}}}
+        end
+      )
+
+    assert_received {:tracker_linear_client_called, "query Viewer { viewer { id } }", %{}, [tracker_settings: ^tracker_settings]}
+
+    assert response["success"] == true
+  end
+
   test "linear_graphql accepts a raw GraphQL query string" do
     test_pid = self()
 
@@ -327,6 +371,44 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
                "reason" => ":boom"
              }
            }
+  end
+
+  test "linear_graphql formats native app credential and API failures" do
+    cases = [
+      {{:missing_linear_agent_setting, :client_secret},
+       %{
+         "error" => %{
+           "message" => "Symphony's Linear app credential is missing client_secret.",
+           "setting" => "client_secret"
+         }
+       }},
+      {{:linear_agent_api_status, 401},
+       %{
+         "error" => %{
+           "message" => "Linear app GraphQL request failed with HTTP 401.",
+           "status" => 401
+         }
+       }},
+      {{:linear_agent_graphql_errors, [%{"message" => "Forbidden"}]},
+       %{
+         "error" => %{
+           "message" => "Linear rejected the app GraphQL request.",
+           "errors" => [%{"message" => "Forbidden"}]
+         }
+       }}
+    ]
+
+    Enum.each(cases, fn {reason, expected} ->
+      response =
+        DynamicTool.execute(
+          "linear_graphql",
+          %{"query" => "query Viewer { viewer { id } }"},
+          linear_client: fn _query, _variables, _opts -> {:error, reason} end
+        )
+
+      assert response["success"] == false
+      assert Jason.decode!(response["output"]) == expected
+    end)
   end
 
   test "linear_graphql falls back to inspect for non-JSON payloads" do
