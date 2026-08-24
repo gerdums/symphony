@@ -21,6 +21,8 @@ defmodule SymphonyElixir.Linear.AgentBridge do
             issue_by_session: %{},
             pending_prompts: %{},
             proof_counts: %{},
+            waiting_issues: MapSet.new(),
+            work_started_issues: MapSet.new(),
             seen_webhooks: MapSet.new()
 
   @type state :: %__MODULE__{}
@@ -42,9 +44,25 @@ defmodule SymphonyElixir.Linear.AgentBridge do
     GenServer.call(server, {:ensure_session, issue}, 35_000)
   end
 
+  @spec waiting_for_slot(Issue.t(), GenServer.server()) :: :ok
+  def waiting_for_slot(%Issue{} = issue, server \\ __MODULE__) do
+    GenServer.cast(server, {:waiting_for_slot, issue})
+  end
+
   @spec start_work(Issue.t(), GenServer.server()) :: :ok | {:error, term()} | :disabled
   def start_work(%Issue{} = issue, server \\ __MODULE__) do
     GenServer.call(server, {:start_work, issue}, 35_000)
+  end
+
+  @spec setup_repair_started(String.t(), pos_integer(), pos_integer(), GenServer.server()) :: :ok
+  def setup_repair_started(issue_id, attempt, total, server \\ __MODULE__)
+      when is_binary(issue_id) and is_integer(attempt) and is_integer(total) do
+    GenServer.cast(server, {:setup_repair_started, issue_id, attempt, total})
+  end
+
+  @spec setup_repair_succeeded(String.t(), GenServer.server()) :: :ok
+  def setup_repair_succeeded(issue_id, server \\ __MODULE__) when is_binary(issue_id) do
+    GenServer.cast(server, {:setup_repair_succeeded, issue_id})
   end
 
   @spec session_for_issue(String.t(), GenServer.server()) :: String.t() | nil
@@ -128,16 +146,9 @@ defmodule SymphonyElixir.Linear.AgentBridge do
         {:reply, {:ok, session_id}, state}
 
       true ->
-        case find_or_create_session(state, issue_id, settings.app_user_id) do
-          {:ok, %{"id" => session_id}} when is_binary(session_id) ->
-            state = put_session(state, issue_id, session_id)
-            {:reply, {:ok, session_id}, state}
-
-          {:error, reason} ->
-            {:reply, {:error, reason}, state}
-
-          other ->
-            {:reply, {:error, {:invalid_agent_session_response, other}}, state}
+        case ensure_issue_session(state, issue_id, settings.app_user_id) do
+          {:ok, session_id, state} -> {:reply, {:ok, session_id}, state}
+          {:error, reason, state} -> {:reply, {:error, reason}, state}
         end
     end
   end
@@ -149,15 +160,18 @@ defmodule SymphonyElixir.Linear.AgentBridge do
       !settings.enabled ->
         {:reply, :disabled, state}
 
-      !settings.assign_on_start ->
-        {:reply, :ok, state}
-
       is_nil(session_id(state, issue_id)) ->
         {:reply, {:error, :missing_linear_agent_session}, state}
 
       true ->
-        result = assign_issue_to_app(state, issue_id, settings.app_user_id)
-        {:reply, result, state}
+        case maybe_assign_issue_to_app(state, issue_id, settings) do
+          :ok ->
+            state = announce_work_started(state, issue_id)
+            {:reply, :ok, state}
+
+          {:error, _reason} = error ->
+            {:reply, error, state}
+        end
     end
   end
 
@@ -236,6 +250,67 @@ defmodule SymphonyElixir.Linear.AgentBridge do
   @impl true
   def handle_cast({:accept_webhook, payload}, state) do
     {:noreply, handle_webhook(payload, state)}
+  end
+
+  def handle_cast({:waiting_for_slot, %Issue{id: issue_id}}, state) when is_binary(issue_id) do
+    settings = Config.settings!().linear_agent
+
+    cond do
+      !settings.enabled ->
+        {:noreply, state}
+
+      MapSet.member?(state.waiting_issues, issue_id) ->
+        {:noreply, state}
+
+      true ->
+        case ensure_issue_session(state, issue_id, settings.app_user_id) do
+          {:ok, agent_session_id, state} ->
+            _ =
+              state.client.update_session(
+                agent_session_id,
+                %{
+                  "plan" => [
+                    %{
+                      "content" => "Waiting for an available worker slot on any configured computer",
+                      "status" => "inProgress"
+                    }
+                  ]
+                },
+                client_opts(state)
+              )
+
+            _ =
+              create_activity(state, agent_session_id, %{
+                "type" => "thought",
+                "body" => "This ticket is ready. Symphony is waiting for an available worker slot on one of the configured computers."
+              })
+
+            {:noreply, %{state | waiting_issues: MapSet.put(state.waiting_issues, issue_id)}}
+
+          {:error, reason, state} ->
+            Logger.warning("Unable to create a Linear waiting session for issue_id=#{issue_id}: #{inspect(reason)}")
+
+            {:noreply, state}
+        end
+    end
+  end
+
+  def handle_cast({:setup_repair_started, issue_id, attempt, total}, state) do
+    publish_issue_activity(state, issue_id, %{
+      "type" => "thought",
+      "body" => "Workspace setup hit an error. A bounded recovery agent is diagnosing it before setup is retried (attempt #{attempt}/#{total})."
+    })
+
+    {:noreply, state}
+  end
+
+  def handle_cast({:setup_repair_succeeded, issue_id}, state) do
+    publish_issue_activity(state, issue_id, %{
+      "type" => "thought",
+      "body" => "Workspace setup recovered and passed validation. The ticket work is continuing."
+    })
+
+    {:noreply, state}
   end
 
   def handle_cast({:codex_update, issue_id, update}, state) do
@@ -379,6 +454,10 @@ defmodule SymphonyElixir.Linear.AgentBridge do
 
   defp notify_orchestrator(_orchestrator, _issue_id), do: :ok
 
+  defp activity_for_update(%{event: :session_started, phase: :setup_repair}) do
+    %{"type" => "thought", "body" => "A Codex setup-recovery worker started for this task."}
+  end
+
   defp activity_for_update(%{event: :session_started}) do
     %{"type" => "thought", "body" => "A Codex worker started this task."}
   end
@@ -469,6 +548,16 @@ defmodule SymphonyElixir.Linear.AgentBridge do
     end
   end
 
+  defp publish_issue_activity(state, issue_id, content) do
+    case session_id(state, issue_id) do
+      agent_session_id when is_binary(agent_session_id) ->
+        _ = create_activity(state, agent_session_id, content)
+
+      _ ->
+        :ok
+    end
+  end
+
   defp client_opts(state, opts \\ []) do
     Keyword.merge(state.client_opts, opts)
   end
@@ -478,6 +567,67 @@ defmodule SymphonyElixir.Linear.AgentBridge do
       {:ok, %{} = session} -> {:ok, session}
       :not_found -> state.client.create_session(issue_id, client_opts(state))
       {:error, reason} -> {:error, {:linear_agent_session_lookup_failed, reason}}
+    end
+  end
+
+  defp ensure_issue_session(state, issue_id, app_user_id) do
+    case session_id(state, issue_id) do
+      session_id when is_binary(session_id) ->
+        {:ok, session_id, state}
+
+      _ ->
+        case find_or_create_session(state, issue_id, app_user_id) do
+          {:ok, %{"id" => session_id}} when is_binary(session_id) ->
+            {:ok, session_id, put_session(state, issue_id, session_id)}
+
+          {:error, reason} ->
+            {:error, reason, state}
+
+          other ->
+            {:error, {:invalid_agent_session_response, other}, state}
+        end
+    end
+  end
+
+  defp maybe_assign_issue_to_app(_state, _issue_id, %{assign_on_start: false}), do: :ok
+
+  defp maybe_assign_issue_to_app(state, issue_id, settings) do
+    assign_issue_to_app(state, issue_id, settings.app_user_id)
+  end
+
+  defp announce_work_started(state, issue_id) do
+    state = %{state | waiting_issues: MapSet.delete(state.waiting_issues, issue_id)}
+
+    if MapSet.member?(state.work_started_issues, issue_id) do
+      state
+    else
+      case session_id(state, issue_id) do
+        agent_session_id when is_binary(agent_session_id) ->
+          _ =
+            state.client.update_session(
+              agent_session_id,
+              %{
+                "plan" => [
+                  %{"content" => "Preparing the ticket workspace", "status" => "inProgress"}
+                ]
+              },
+              client_opts(state)
+            )
+
+          _ =
+            create_activity(state, agent_session_id, %{
+              "type" => "thought",
+              "body" => "A worker slot is available. Symphony is preparing the ticket workspace."
+            })
+
+        _ ->
+          :ok
+      end
+
+      %{
+        state
+        | work_started_issues: MapSet.put(state.work_started_issues, issue_id)
+      }
     end
   end
 

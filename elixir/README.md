@@ -127,10 +127,13 @@ workspace:
   root: ~/code/workspaces
 hooks:
   after_create: |
-    git clone git@github.com:your-org/your-repo.git .
+    if [ ! -d .git ]; then
+      git clone git@github.com:your-org/your-repo.git .
+    fi
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  setup_repair_attempts: 1
 codex:
   command: codex app-server
 ---
@@ -170,6 +173,11 @@ Notes:
   by the Codex turn sandbox.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- `agent.setup_repair_attempts` controls bounded Codex recovery turns after a new workspace's
+  `after_create` hook fails. The default is `1`; set it to `0` to disable recovery. Each recovery
+  turn receives sanitized failure output, is prohibited from accessing secrets or implementing the
+  ticket, and must pass a rerun of `after_create` before normal ticket work begins. Make
+  `after_create` idempotent so it is safe to rerun after partial setup.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
@@ -211,6 +219,11 @@ Symphony can optionally appear as a native Linear agent instead of reporting thr
 comments. The native session stays attached to the Linear issue while execution runs locally or on
 an SSH worker. Replies in that session are injected into the current Codex turn with `turn/steer`,
 and are queued for the next run when no turn is active.
+
+Eligible tickets that cannot start because every configured worker is full keep the same native
+session and show a durable waiting plan/activity in Linear. When a slot opens, that session moves to
+workspace preparation and then streams the coding agent's progress; it does not create a
+machine-specific replacement session.
 
 Create a Linear OAuth application with the `read`, `write`, `app:assignable`, and
 `app:mentionable` scopes, enable Agent Session events, and point its webhook at
@@ -288,9 +301,10 @@ are also stripped from the local Codex child environment so host topology does n
 inherited shell environment.
 
 When `linear_agent.assign_on_start` (or `SYMPHONY_LINEAR_AGENT_ASSIGN_ON_START`) is true, Symphony
-assigns the issue to the OAuth app user after workspace preparation succeeds and before Codex starts.
-Assignment failure prevents the coding turn from starting, so an app cannot work a ticket while the
-issue still appears assigned elsewhere.
+assigns the issue to the OAuth app user after a worker slot is admitted and before workspace
+preparation begins. Assignment failure prevents setup or coding from starting, so an app cannot work
+a ticket while the issue still appears assigned elsewhere. A queued ticket remains unassigned until
+capacity is actually available.
 
 ### Linear adapter profile
 
