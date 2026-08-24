@@ -268,8 +268,10 @@ defmodule SymphonyElixir.Linear.AgentBridge do
             "![#{escape_alt_text(caption)}](#{asset_url})"
 
         content = %{
-          "type" => "response",
-          "body" => proof_body
+          "type" => "action",
+          "action" => "Screenshot proof",
+          "parameter" => safe_activity_text(caption, 240),
+          "result" => proof_body
         }
 
         case create_activity(state, agent_session_id, content) do
@@ -757,8 +759,11 @@ defmodule SymphonyElixir.Linear.AgentBridge do
 
   defp activity_for_started_item(_item), do: nil
 
+  # An app-server agentMessage can be emitted before the worker turn has actually
+  # ended. Linear treats a response activity as the terminal answer for the
+  # current agent turn, so progress messages must remain non-terminal.
   defp activity_for_completed_item(%{"type" => "agentMessage", "text" => text}),
-    do: response_activity(text)
+    do: thought_activity(text)
 
   defp activity_for_completed_item(%{"type" => "reasoning"} = item),
     do: thought_activity(reasoning_summary(item))
@@ -804,15 +809,6 @@ defmodule SymphonyElixir.Linear.AgentBridge do
   end
 
   defp thought_activity(_text), do: nil
-
-  defp response_activity(text) when is_binary(text) do
-    case safe_activity_text(text, 4_000) do
-      "" -> nil
-      body -> %{"type" => "response", "body" => body}
-    end
-  end
-
-  defp response_activity(_text), do: nil
 
   defp reasoning_summary(%{"summary" => summary}) when is_list(summary) do
     summary
