@@ -2382,6 +2382,11 @@ the workflow.
   native error activity for every retry. Repeated non-recoverable failures for one ticket SHOULD be
   coalesced so a retry loop does not emit duplicate native error activities while the same session
   remains active.
+- The bridge MUST consume the actual top-level app-server notification payload and mirror plan
+  updates, visible reasoning summaries, agent messages, and tool/file/command lifecycle events into
+  the same native session. It MUST NOT forward hidden reasoning or unbounded raw command output.
+- Prompts sent from the native Linear session SHOULD steer the active Codex turn and MUST remain
+  associated with the issue's durable session across worker-host changes and process restarts.
 - Waiting-session provisioning and progress/activity publication MUST run outside the bridge's
   serialized state loop so slow Linear network calls cannot starve worker startup or live prompts.
 - The webhook endpoint MUST verify `Linear-Signature` against the raw body using HMAC-SHA256 and

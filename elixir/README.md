@@ -317,6 +317,11 @@ error activity on every retry. Non-recoverable coding-agent failures remain coal
 native error notification per bridge lifetime while Symphony keeps the session and retry state
 attached.
 
+While a Codex turn is active, Symphony mirrors its plan, visible reasoning summaries, agent
+messages, and tool/file/command lifecycle into the same native Linear Agent Session. Replies sent
+from that session steer the active Codex turn. Raw hidden reasoning and command output are not
+forwarded, and streamed text is bounded and scrubbed for credential-like values.
+
 Waiting-session provisioning and progress/activity delivery run asynchronously from the bridge's
 state loop. A slow Linear request therefore does not block admitted workers from starting or prevent
 an active worker from consuming a follow-up prompt.

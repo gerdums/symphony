@@ -368,15 +368,13 @@ defmodule SymphonyElixir.LinearAgentTest do
         "issue-1",
         %{
           event: :notification,
-          details: %{
-            payload: %{
-              "method" => "turn/plan/updated",
-              "params" => %{
-                "plan" => [
-                  %{"step" => "Implement", "status" => "inProgress"},
-                  %{"step" => "Validate", "status" => "pending"}
-                ]
-              }
+          payload: %{
+            "method" => "turn/plan/updated",
+            "params" => %{
+              "plan" => [
+                %{"step" => "Implement", "status" => "inProgress"},
+                %{"step" => "Validate", "status" => "pending"}
+              ]
             }
           }
         },
@@ -428,6 +426,149 @@ defmodule SymphonyElixir.LinearAgentTest do
                      }}
 
     assert_received {:activity, %{"content" => %{"type" => "response", "body" => "Done"}}}
+  end
+
+  test "bridge streams real app-server notifications into the native Linear session" do
+    test_pid = self()
+
+    request_fun = fn payload, _headers ->
+      cond do
+        payload["query"] =~ "SymphonyCreateAgentActivity" ->
+          send(test_pid, {:activity, payload["variables"]["input"]})
+
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "data" => %{
+                 "agentActivityCreate" => %{
+                   "success" => true,
+                   "agentActivity" => %{"id" => "activity-stream"}
+                 }
+               }
+             }
+           }}
+
+        payload["query"] =~ "SymphonyUpdateAgentSession" ->
+          send(test_pid, {:session_update, payload["variables"]})
+
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "data" => %{
+                 "agentSessionUpdate" => %{
+                   "success" => true,
+                   "agentSession" => %{"id" => "session-stream"}
+                 }
+               }
+             }
+           }}
+
+        true ->
+          flunk("unexpected GraphQL operation")
+      end
+    end
+
+    bridge_name = String.to_atom("linear_agent_stream_bridge_#{System.unique_integer([:positive])}")
+
+    start_supervised!({AgentBridge, name: bridge_name, orchestrator: nil, client_opts: [request_fun: request_fun]})
+
+    assert :ok =
+             AgentBridge.accept_webhook(
+               %{
+                 "action" => "created",
+                 "webhookId" => "stream-webhook",
+                 "oauthClientId" => "oauth-client",
+                 "appUserId" => "app-user",
+                 "agentSession" => %{"id" => "session-stream", "issueId" => "issue-stream"}
+               },
+               bridge_name
+             )
+
+    assert :ok =
+             AgentBridge.report_codex_update(
+               "issue-stream",
+               %{
+                 event: :notification,
+                 payload: %{
+                   "method" => "item/started",
+                   "params" => %{
+                     "item" => %{"id" => "command-1", "type" => "commandExecution"}
+                   }
+                 }
+               },
+               bridge_name
+             )
+
+    assert_receive {:activity,
+                    %{
+                      "content" => %{
+                        "type" => "action",
+                        "action" => "Running command",
+                        "parameter" => "Executing a workspace command"
+                      },
+                      "ephemeral" => true
+                    }},
+                   1_000
+
+    assert :ok =
+             AgentBridge.report_codex_update(
+               "issue-stream",
+               %{
+                 event: :notification,
+                 payload: %{
+                   "method" => "item/completed",
+                   "params" => %{
+                     "item" => %{
+                       "id" => "reasoning-1",
+                       "type" => "reasoning",
+                       "summary" => ["Checking the current implementation.", "Bearer private-value"]
+                     }
+                   }
+                 }
+               },
+               bridge_name
+             )
+
+    assert_receive {:activity,
+                    %{
+                      "content" => %{
+                        "type" => "thought",
+                        "body" => "Checking the current implementation.\n\nBearer [REDACTED]"
+                      },
+                      "ephemeral" => true
+                    }},
+                   1_000
+
+    assert :ok =
+             AgentBridge.report_codex_update(
+               "issue-stream",
+               %{
+                 event: :notification,
+                 payload: %{
+                   "method" => "item/completed",
+                   "params" => %{
+                     "item" => %{
+                       "id" => "message-1",
+                       "type" => "agentMessage",
+                       "text" => "I updated the implementation and am validating it now."
+                     }
+                   }
+                 }
+               },
+               bridge_name
+             )
+
+    assert_receive {:activity,
+                    %{
+                      "content" => %{
+                        "type" => "thought",
+                        "body" => "I updated the implementation and am validating it now."
+                      },
+                      "ephemeral" => true
+                    }},
+                   1_000
   end
 
   test "bridge takes assignment only when work is ready to start" do

@@ -590,50 +590,179 @@ defmodule SymphonyElixir.Linear.AgentBridge do
     %{"type" => "error", "body" => "The Codex worker encountered an error. Symphony will preserve the session for recovery."}
   end
 
-  defp activity_for_update(%{event: :notification, details: %{payload: payload}}) do
-    action_for_notification(payload)
+  defp activity_for_update(%{event: :notification} = update) do
+    update
+    |> notification_payload()
+    |> activity_for_notification()
   end
 
   defp activity_for_update(_update), do: nil
 
-  defp action_for_notification(%{"method" => "item/started", "params" => %{"item" => item}})
+  defp activity_for_notification(%{"method" => "item/started", "params" => %{"item" => item}})
        when is_map(item) do
-    case item["type"] do
-      "commandExecution" ->
-        %{"type" => "action", "action" => "Running command", "parameter" => "Workspace validation"}
+    activity_for_started_item(item)
+  end
 
-      "fileChange" ->
-        %{"type" => "action", "action" => "Editing files", "parameter" => "Applying implementation changes"}
+  defp activity_for_notification(%{"method" => "item/completed", "params" => %{"item" => item}})
+       when is_map(item) do
+    activity_for_completed_item(item)
+  end
 
-      "mcpToolCall" ->
-        %{"type" => "action", "action" => "Using a connected tool", "parameter" => "External verification"}
+  defp activity_for_notification(_payload), do: nil
 
-      _ ->
-        nil
+  defp activity_for_started_item(%{"type" => "commandExecution"}),
+    do: action_activity("Running command", "Executing a workspace command")
+
+  defp activity_for_started_item(%{"type" => "fileChange"}),
+    do: action_activity("Editing files", "Applying implementation changes")
+
+  defp activity_for_started_item(%{"type" => "mcpToolCall"} = item),
+    do: action_activity("Using a connected tool", connected_tool_label(item))
+
+  defp activity_for_started_item(%{"type" => "dynamicToolCall"} = item),
+    do: action_activity("Using a Symphony tool", dynamic_tool_label(item))
+
+  defp activity_for_started_item(%{"type" => "webSearch"}),
+    do: action_activity("Searching the web", "Gathering current source material")
+
+  defp activity_for_started_item(%{"type" => "imageView"}),
+    do: action_activity("Inspecting an image", "Reviewing visual evidence")
+
+  defp activity_for_started_item(%{"type" => "imageGeneration"}),
+    do: action_activity("Generating an image", "Creating a visual asset")
+
+  defp activity_for_started_item(%{"type" => "reasoning"}),
+    do: thought_activity("Analyzing the ticket and current workspace state.")
+
+  defp activity_for_started_item(_item), do: nil
+
+  defp activity_for_completed_item(%{"type" => "agentMessage", "text" => text}),
+    do: thought_activity(text)
+
+  defp activity_for_completed_item(%{"type" => "reasoning"} = item),
+    do: thought_activity(reasoning_summary(item))
+
+  defp activity_for_completed_item(%{"type" => "plan", "text" => text}),
+    do: thought_activity(text)
+
+  defp activity_for_completed_item(%{"type" => "commandExecution"} = item),
+    do: action_activity("Command finished", command_result_label(item))
+
+  defp activity_for_completed_item(%{"type" => "fileChange"} = item),
+    do: action_activity("Files updated", file_change_label(item))
+
+  defp activity_for_completed_item(%{"type" => "mcpToolCall"} = item),
+    do: action_activity("Connected tool finished", connected_tool_label(item))
+
+  defp activity_for_completed_item(%{"type" => "dynamicToolCall"} = item),
+    do: action_activity("Symphony tool finished", dynamic_tool_label(item))
+
+  defp activity_for_completed_item(%{"type" => "webSearch"}),
+    do: action_activity("Web research finished", "Sources are available to the worker")
+
+  defp activity_for_completed_item(%{"type" => "imageView"}),
+    do: action_activity("Image review finished", "Visual evidence was inspected")
+
+  defp activity_for_completed_item(%{"type" => "imageGeneration"}),
+    do: action_activity("Image generation finished", "A visual asset was produced")
+
+  defp activity_for_completed_item(%{"type" => "contextCompaction"}),
+    do: thought_activity("Condensed the working context and continued.")
+
+  defp activity_for_completed_item(_item), do: nil
+
+  defp action_activity(action, parameter) when is_binary(action) and is_binary(parameter) do
+    %{"type" => "action", "action" => action, "parameter" => safe_activity_text(parameter, 240)}
+  end
+
+  defp thought_activity(text) when is_binary(text) do
+    case safe_activity_text(text, 4_000) do
+      "" -> nil
+      body -> %{"type" => "thought", "body" => body}
     end
   end
 
-  defp action_for_notification(_payload), do: nil
+  defp thought_activity(_text), do: nil
+
+  defp reasoning_summary(%{"summary" => summary}) when is_list(summary) do
+    summary
+    |> Enum.filter(&is_binary/1)
+    |> Enum.join("\n\n")
+  end
+
+  defp reasoning_summary(%{"summary" => summary}) when is_binary(summary), do: summary
+  defp reasoning_summary(_item), do: nil
+
+  defp connected_tool_label(item) do
+    [item["server"], item["tool"]]
+    |> Enum.filter(&(is_binary(&1) and String.trim(&1) != ""))
+    |> Enum.join(" / ")
+    |> default_activity_label("Connected tool")
+  end
+
+  defp dynamic_tool_label(item) do
+    [item["namespace"], item["tool"]]
+    |> Enum.filter(&(is_binary(&1) and String.trim(&1) != ""))
+    |> Enum.join(" / ")
+    |> default_activity_label("Symphony tool")
+  end
+
+  defp default_activity_label("", fallback), do: fallback
+  defp default_activity_label(label, _fallback), do: label
+
+  defp command_result_label(item) do
+    case item["exitCode"] do
+      code when is_integer(code) -> "Exited with status #{code}"
+      _ -> "Command execution completed"
+    end
+  end
+
+  defp file_change_label(%{"changes" => changes}) when is_list(changes) do
+    case length(changes) do
+      1 -> "Updated 1 file"
+      count -> "Updated #{count} files"
+    end
+  end
+
+  defp file_change_label(_item), do: "Applied implementation changes"
+
+  defp safe_activity_text(text, max_length) do
+    sanitized =
+      text
+      |> String.trim()
+      |> String.replace(
+        ~r{(?i)(authorization|bearer|token|secret|password)(\s*[:=]?\s+)[^\s]+},
+        "\\1\\2[REDACTED]"
+      )
+      |> String.replace(~r{(?i)://[^/@\s:]+:[^/@\s]+@}, "://[REDACTED]@")
+      |> String.replace(~r{\b(?:ghp|github_pat|lin_api)_[A-Za-z0-9_\-]+\b}, "[REDACTED]")
+
+    if String.length(sanitized) > max_length do
+      String.slice(sanitized, 0, max_length) <> "…"
+    else
+      sanitized
+    end
+  end
 
   defp ephemeral_update?(%{event: :session_started}), do: true
   defp ephemeral_update?(%{event: :notification}), do: true
   defp ephemeral_update?(_update), do: false
 
-  defp plan_for_update(%{
-         event: :notification,
-         details: %{
-           payload: %{"method" => "turn/plan/updated", "params" => %{"plan" => plan}}
-         }
-       })
-       when is_list(plan) do
-    Enum.flat_map(plan, fn
-      %{"step" => content, "status" => status}
-      when is_binary(content) and status in ["pending", "inProgress", "completed"] ->
-        [%{"content" => content, "status" => status}]
+  defp plan_for_update(%{event: :notification} = update) do
+    case notification_payload(update) do
+      %{"method" => "turn/plan/updated", "params" => %{"plan" => plan}} when is_list(plan) ->
+        Enum.flat_map(plan, fn
+          %{"step" => content, "status" => status}
+          when is_binary(content) and status in ["pending", "inProgress", "completed"] ->
+            [%{"content" => content, "status" => status}]
+
+          _ ->
+            []
+        end)
 
       _ ->
-        []
-    end)
+        nil
+    end
   end
 
   defp plan_for_update(%{event: event})
@@ -647,6 +776,10 @@ defmodule SymphonyElixir.Linear.AgentBridge do
   end
 
   defp plan_for_update(_update), do: nil
+
+  defp notification_payload(%{payload: payload}) when is_map(payload), do: payload
+  defp notification_payload(%{details: %{payload: payload}}) when is_map(payload), do: payload
+  defp notification_payload(_update), do: nil
 
   defp create_activity(state, agent_session_id, content, opts \\ []) do
     case state.client.create_activity(agent_session_id, content, client_opts(state, opts)) do
