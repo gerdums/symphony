@@ -1027,6 +1027,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.tracker.exclude_labels == []
     assert config.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
     assert config.worker.max_concurrent_agents_per_host == nil
+    assert config.agent.provider == "codex"
     assert config.agent.max_concurrent_agents == 10
     assert config.codex.command == "codex app-server"
 
@@ -1055,6 +1056,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.turn_timeout_ms == 3_600_000
     assert config.codex.read_timeout_ms == 5_000
     assert config.codex.stall_timeout_ms == 300_000
+    assert config.claude.command == "claude"
+    assert config.claude.turn_timeout_ms == 3_600_000
+    assert config.claude.stall_timeout_ms == 300_000
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_required_labels: [" Symphony ", "SYMPHONY", "JavaScript"]

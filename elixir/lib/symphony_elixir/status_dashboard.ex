@@ -593,7 +593,13 @@ defmodule SymphonyElixir.StatusDashboard do
     state = running_entry.state || "unknown"
     state_display = format_cell(to_string(state), @running_stage_width)
     session = running_entry.session_id |> compact_session_id() |> format_cell(@running_session_width)
-    pid = format_cell(running_entry.codex_app_server_pid || "n/a", @running_pid_width)
+
+    pid =
+      format_cell(
+        Map.get(running_entry, :agent_process_pid) || running_entry.codex_app_server_pid || "n/a",
+        @running_pid_width
+      )
+
     total_tokens = running_entry.codex_total_tokens || 0
     runtime_seconds = running_entry.runtime_seconds || 0
     turn_count = Map.get(running_entry, :turn_count, 0)

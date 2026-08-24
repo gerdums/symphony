@@ -102,6 +102,86 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            }
   end
 
+  test "orchestrator integrates Claude provider events without Codex protocol fields" do
+    issue_id = "issue-claude-snapshot"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-CLAUDE",
+      title: "Claude snapshot test",
+      description: "Capture provider-neutral state",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-CLAUDE"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :ClaudeSnapshotOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    now = DateTime.utc_now()
+
+    for turn_number <- [1, 2] do
+      send(
+        pid,
+        {:codex_worker_update, issue_id,
+         %{
+           event: :session_started,
+           agent_provider: :claude,
+           agent_process_pid: "5150",
+           session_id: "claude-session-123",
+           turn_number: turn_number,
+           timestamp: now
+         }}
+      )
+    end
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :turn_completed,
+         agent_provider: :claude,
+         session_id: "claude-session-123",
+         usage: %{"input_tokens" => 20, "output_tokens" => 5},
+         payload: %{"type" => "result", "subtype" => "success"},
+         timestamp: now
+       }}
+    )
+
+    assert %{running: [snapshot_entry]} = GenServer.call(pid, :snapshot)
+    assert snapshot_entry.agent_provider == :claude
+    assert snapshot_entry.agent_process_pid == "5150"
+    assert snapshot_entry.codex_app_server_pid == nil
+    assert snapshot_entry.session_id == "claude-session-123"
+    assert snapshot_entry.turn_count == 2
+    assert snapshot_entry.codex_input_tokens == 20
+    assert snapshot_entry.codex_output_tokens == 5
+  end
+
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
     issue_id = "issue-usage-snapshot"
 
