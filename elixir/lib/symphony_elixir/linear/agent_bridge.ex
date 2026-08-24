@@ -51,6 +51,15 @@ defmodule SymphonyElixir.Linear.AgentBridge do
     GenServer.cast(server, {:waiting_for_slot, issue})
   end
 
+  @doc """
+  Marks an already-open native session as waiting without creating a session
+  for a ticket that has not been admitted yet.
+  """
+  @spec waiting_for_existing_slot(Issue.t(), GenServer.server()) :: :ok
+  def waiting_for_existing_slot(%Issue{} = issue, server \\ __MODULE__) do
+    GenServer.cast(server, {:waiting_for_existing_slot, issue})
+  end
+
   @spec start_work(Issue.t(), GenServer.server()) :: :ok | {:error, term()} | :disabled
   def start_work(%Issue{} = issue, server \\ __MODULE__) do
     GenServer.call(server, {:start_work, issue}, 35_000)
@@ -106,6 +115,11 @@ defmodule SymphonyElixir.Linear.AgentBridge do
   def fail(issue_id, message, server \\ __MODULE__)
       when is_binary(issue_id) and is_binary(message) do
     GenServer.cast(server, {:failure, issue_id, message})
+  end
+
+  @spec recovering(String.t(), GenServer.server()) :: :ok
+  def recovering(issue_id, server \\ __MODULE__) when is_binary(issue_id) do
+    GenServer.cast(server, {:recovering, issue_id})
   end
 
   @spec prompt_guidance() :: String.t() | nil
@@ -274,6 +288,26 @@ defmodule SymphonyElixir.Linear.AgentBridge do
     end
   end
 
+  def handle_cast({:waiting_for_existing_slot, %Issue{id: issue_id}}, state)
+      when is_binary(issue_id) do
+    settings = Config.settings!().linear_agent
+
+    cond do
+      !settings.enabled ->
+        {:noreply, state}
+
+      MapSet.member?(state.waiting_issues, issue_id) ->
+        {:noreply, state}
+
+      agent_session_id = session_id(state, issue_id) ->
+        publish_waiting_status_async(state, agent_session_id)
+        {:noreply, mark_waiting(state, issue_id)}
+
+      true ->
+        {:noreply, state}
+    end
+  end
+
   def handle_cast({:setup_repair_started, issue_id, attempt, total}, state) do
     publish_issue_activity_async(state, issue_id, %{
       "type" => "thought",
@@ -308,6 +342,18 @@ defmodule SymphonyElixir.Linear.AgentBridge do
          | failure_notified_issues: MapSet.put(state.failure_notified_issues, issue_id)
        }}
     end
+  end
+
+  def handle_cast({:recovering, issue_id}, state) do
+    case session_id(state, issue_id) do
+      agent_session_id when is_binary(agent_session_id) ->
+        publish_recovering_status_async(state, agent_session_id)
+
+      _ ->
+        :ok
+    end
+
+    {:noreply, state}
   end
 
   def handle_cast({:activity, issue_id, content, opts}, state) do
@@ -711,6 +757,24 @@ defmodule SymphonyElixir.Linear.AgentBridge do
         "type" => "thought",
         "body" => "This ticket is ready. Symphony is waiting for an available worker slot on one of the configured computers."
       })
+    end)
+  end
+
+  defp publish_recovering_status_async(state, agent_session_id) do
+    run_async(fn ->
+      _ =
+        state.client.update_session(
+          agent_session_id,
+          %{
+            "plan" => [
+              %{
+                "content" => "Recovering the worker after a transient failure",
+                "status" => "inProgress"
+              }
+            ]
+          },
+          client_opts(state)
+        )
     end)
   end
 

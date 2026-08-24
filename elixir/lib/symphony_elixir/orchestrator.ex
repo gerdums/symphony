@@ -282,7 +282,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_agent_down(state, issue_id, running_entry, session_id, reason) do
-    :ok = AgentBridge.fail(issue_id, "The worker stopped unexpectedly. Symphony will retry while preserving this session.")
+    :ok = AgentBridge.recovering(issue_id)
     Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
 
     next_attempt = next_retry_attempt_from_running(running_entry)
@@ -829,7 +829,7 @@ defmodule SymphonyElixir.Orchestrator do
           dispatch_issue(state_acc, issue)
 
         queueable_issue?(issue, state_acc, active_states, terminal_states) ->
-          :ok = AgentBridge.waiting_for_slot(issue)
+          :ok = AgentBridge.waiting_for_existing_slot(issue)
           state_acc
 
         true ->

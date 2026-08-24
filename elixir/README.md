@@ -163,6 +163,8 @@ Notes:
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
 - `codex.turn_timeout_ms` is the maximum silence interval while a turn is streaming. Each
   app-server update resets it; it is not a total turn runtime cap.
+- `codex.read_timeout_ms` defaults to 30 seconds for app-server request/response handshakes, which
+  leaves enough startup time for remote hosts and larger Codex plugin configurations.
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
@@ -220,9 +222,10 @@ comments. The native session stays attached to the Linear issue while execution 
 an SSH worker. Replies in that session are injected into the current Codex turn with `turn/steer`,
 and are queued for the next run when no turn is active.
 
-Eligible tickets that cannot start because every configured worker is full keep the same native
-session and show a durable waiting plan/activity in Linear. When a slot opens, that session moves to
-workspace preparation and then streams the coding agent's progress; it does not create a
+Eligible tickets that already have a native session but cannot start because every configured
+worker is full keep that session and show a durable waiting plan/activity in Linear. Normal polling
+does not create agent sessions for every unadmitted ticket. When a slot opens, an existing session
+moves to workspace preparation and then streams the coding agent's progress; it does not create a
 machine-specific replacement session.
 
 Create a Linear OAuth application with the `read`, `write`, `app:assignable`, and
@@ -275,6 +278,8 @@ For a coordinator that can run locally and on one or more SSH workers, opt the l
 same least-loaded pool:
 
 ```yaml
+agent:
+  max_concurrent_agents: 4
 worker:
   include_local: true
   ssh_hosts:
@@ -284,6 +289,8 @@ worker:
 
 `include_local` defaults to `false` when SSH hosts are configured, preserving remote-only behavior.
 When it is `true`, local wins equal-load ties and remote capacity is used as the local host fills.
+Set `agent.max_concurrent_agents` no higher than the sum of the configured per-host capacity so the
+orchestrator does not admit more runs than the worker pool can execute.
 Only the coordinator needs the public webhook and Linear OAuth credentials; SSH workers continue to
 communicate over Symphony's existing stdio transport.
 
@@ -305,8 +312,10 @@ assigns the issue to the OAuth app user through Linear's agent `delegate` field 
 is admitted and before workspace preparation begins. The human `assignee` field is intentionally
 left unchanged because Linear models native agents as delegates. Delegation failure prevents setup
 or coding from starting. A queued ticket remains undelegated until capacity is actually available.
-Repeated failures for one ticket produce at most one native stop/error notification while Symphony
-keeps the session and retry state attached.
+A recoverable worker exit updates the existing plan to a recovery state without creating a red
+error activity on every retry. Non-recoverable coding-agent failures remain coalesced to at most one
+native error notification per bridge lifetime while Symphony keeps the session and retry state
+attached.
 
 Waiting-session provisioning and progress/activity delivery run asynchronously from the bridge's
 state loop. A slow Linear request therefore does not block admitted workers from starting or prevent

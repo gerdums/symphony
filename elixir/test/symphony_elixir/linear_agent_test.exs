@@ -610,6 +610,77 @@ defmodule SymphonyElixir.LinearAgentTest do
                    1_000
   end
 
+  test "bridge does not create a native session for an unadmitted queued ticket" do
+    request_fun = fn _payload, _headers ->
+      flunk("queued tickets without a native session must not call Linear")
+    end
+
+    bridge_name = String.to_atom("linear_agent_existing_wait_bridge_#{System.unique_integer([:positive])}")
+
+    start_supervised!({AgentBridge, name: bridge_name, orchestrator: nil, client_opts: [request_fun: request_fun]})
+
+    issue = %Issue{id: "issue-not-admitted"}
+    assert :ok = AgentBridge.waiting_for_existing_slot(issue, bridge_name)
+    assert AgentBridge.session_for_issue(issue.id, bridge_name) == nil
+  end
+
+  test "bridge marks recoverable worker failures in the plan without an error activity" do
+    test_pid = self()
+
+    request_fun = fn payload, _headers ->
+      if payload["query"] =~ "SymphonyUpdateAgentSession" do
+        send(test_pid, {:session_update, payload["variables"]})
+
+        {:ok,
+         %{
+           status: 200,
+           body: %{
+             "data" => %{
+               "agentSessionUpdate" => %{
+                 "success" => true,
+                 "agentSession" => %{"id" => "session-recovering"}
+               }
+             }
+           }
+         }}
+      else
+        flunk("recoverable worker failures must not create an error activity")
+      end
+    end
+
+    bridge_name = String.to_atom("linear_agent_recovering_bridge_#{System.unique_integer([:positive])}")
+
+    start_supervised!({AgentBridge, name: bridge_name, orchestrator: nil, client_opts: [request_fun: request_fun]})
+
+    assert :ok =
+             AgentBridge.accept_webhook(
+               %{
+                 "action" => "created",
+                 "webhookId" => "recovering-webhook",
+                 "oauthClientId" => "oauth-client",
+                 "appUserId" => "app-user",
+                 "agentSession" => %{"id" => "session-recovering", "issueId" => "issue-recovering"}
+               },
+               bridge_name
+             )
+
+    assert :ok = AgentBridge.recovering("issue-recovering", bridge_name)
+
+    assert_receive {:session_update,
+                    %{
+                      "id" => "session-recovering",
+                      "input" => %{
+                        "plan" => [
+                          %{
+                            "content" => "Recovering the worker after a transient failure",
+                            "status" => "inProgress"
+                          }
+                        ]
+                      }
+                    }},
+                   1_000
+  end
+
   test "waiting session provisioning does not block bridge state reads" do
     test_pid = self()
 

@@ -2365,13 +2365,16 @@ the workflow.
 
 - A Linear Agent Session is the durable user-facing conversation and MUST NOT depend on which
   worker host executes the run.
-- When an eligible issue is waiting only because all configured worker slots are full, Symphony
-  SHOULD create or reuse its native session and publish a durable waiting plan/activity. The issue
-  MUST remain unassigned until a worker slot is actually admitted.
+- When an eligible issue with an existing native session is waiting only because all configured
+  worker slots are full, Symphony SHOULD reuse that session and publish a durable waiting
+  plan/activity. Polling MUST NOT create native sessions for every unadmitted queued issue. The issue
+  MUST remain undelegated until a worker slot is actually admitted.
 - Admission SHOULD update the same session to workspace preparation. When assignment-on-start is
   enabled, delegation to the app user MUST succeed before setup or coding work begins.
-- Repeated failures for one ticket SHOULD be coalesced so a retry loop does not emit duplicate native
-  stop/error notifications while the same session remains active.
+- Recoverable worker exits SHOULD update the existing plan to a recovery state without emitting a
+  native error activity for every retry. Repeated non-recoverable failures for one ticket SHOULD be
+  coalesced so a retry loop does not emit duplicate native error activities while the same session
+  remains active.
 - Waiting-session provisioning and progress/activity publication MUST run outside the bridge's
   serialized state loop so slow Linear network calls cannot starve worker startup or live prompts.
 - The webhook endpoint MUST verify `Linear-Signature` against the raw body using HMAC-SHA256 and
