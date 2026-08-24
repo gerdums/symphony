@@ -71,6 +71,14 @@ defmodule SymphonyElixir.Linear.AgentClient do
     }
   }
   """
+  @clear_issue_delegate_mutation """
+  mutation SymphonyClearIssueDelegate($issueId: String!) {
+    issueUpdate(id: $issueId, input: {delegateId: null}) {
+      success
+      issue { id delegate { id } }
+    }
+  }
+  """
   @file_upload_mutation """
   mutation SymphonyPrepareProofUpload($filename: String!, $contentType: String!, $size: Int!) {
     fileUpload(filename: $filename, contentType: $contentType, size: $size, makePublic: false) {
@@ -150,6 +158,13 @@ defmodule SymphonyElixir.Linear.AgentClient do
     variables = %{"issueId" => issue_id, "delegateId" => delegate_id}
 
     with {:ok, body} <- graphql(@assign_issue_mutation, variables, opts) do
+      get_graphql_data(body, ["issueUpdate", "issue"])
+    end
+  end
+
+  @spec clear_issue_delegate(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def clear_issue_delegate(issue_id, opts \\ []) when is_binary(issue_id) do
+    with {:ok, body} <- graphql(@clear_issue_delegate_mutation, %{"issueId" => issue_id}, opts) do
       get_graphql_data(body, ["issueUpdate", "issue"])
     end
   end

@@ -294,7 +294,7 @@ defmodule SymphonyElixir.Linear.AgentBridge do
 
       agent_session_id ->
         run_async(fn ->
-          create_activity(state, agent_session_id, %{"type" => "response", "body" => summary})
+          close_session(state, issue_id, agent_session_id, summary)
         end)
 
         {:noreply, delete_session(state, issue_id, agent_session_id)}
@@ -488,7 +488,7 @@ defmodule SymphonyElixir.Linear.AgentBridge do
           if MapSet.member?(eligible_issue_ids, issue_id) do
             put_session(state_acc, issue_id, session_id)
           else
-            publish_ineligible_session_close_async(state_acc, session_id)
+            publish_ineligible_session_close_async(state_acc, issue_id, session_id)
             state_acc
           end
 
@@ -1046,13 +1046,29 @@ defmodule SymphonyElixir.Linear.AgentBridge do
     end)
   end
 
-  defp publish_ineligible_session_close_async(state, agent_session_id) do
+  defp publish_ineligible_session_close_async(state, issue_id, agent_session_id) do
     run_async(fn ->
-      create_activity(state, agent_session_id, %{
-        "type" => "response",
-        "body" => "Symphony stopped this run because the issue is no longer eligible for this workflow. No worker is currently running."
-      })
+      close_session(
+        state,
+        issue_id,
+        agent_session_id,
+        "Symphony stopped this run because the issue is no longer eligible for this workflow. No worker is currently running."
+      )
     end)
+  end
+
+  defp close_session(state, issue_id, agent_session_id, summary) do
+    activity_result =
+      create_activity(state, agent_session_id, %{"type" => "response", "body" => summary})
+
+    delegate_result = state.client.clear_issue_delegate(issue_id, client_opts(state))
+
+    case {activity_result, delegate_result} do
+      {:ok, {:ok, %{"delegate" => nil}}} -> :ok
+      {:ok, {:ok, issue}} -> {:error, {:linear_agent_assignment_not_cleared, issue}}
+      {{:error, reason}, _delegate_result} -> {:error, reason}
+      {:ok, {:error, reason}} -> {:error, {:linear_agent_assignment_clear_failed, reason}}
+    end
   end
 
   defp request_waiting_session(state, issue_id, app_user_id) do

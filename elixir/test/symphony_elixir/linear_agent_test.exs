@@ -81,6 +81,34 @@ defmodule SymphonyElixir.LinearAgentTest do
     assert payload["variables"] == %{"issueId" => "issue-1", "delegateId" => "app-user"}
   end
 
+  test "agent client clears the OAuth app delegate without changing the human assignee" do
+    test_pid = self()
+
+    request_fun = fn payload, _headers ->
+      send(test_pid, {:assignment_clear_request, payload})
+
+      {:ok,
+       %{
+         status: 200,
+         body: %{
+           "data" => %{
+             "issueUpdate" => %{
+               "success" => true,
+               "issue" => %{"id" => "issue-1", "delegate" => nil}
+             }
+           }
+         }
+       }}
+    end
+
+    assert {:ok, %{"delegate" => nil}} =
+             AgentClient.clear_issue_delegate("issue-1", request_fun: request_fun)
+
+    assert_received {:assignment_clear_request, payload}
+    assert payload["variables"] == %{"issueId" => "issue-1"}
+    refute payload["query"] =~ "assignee"
+  end
+
   test "enabled config advertises proof and keeps all agent secrets out of the child environment" do
     binding = DynamicTool.bind()
 
@@ -1000,6 +1028,22 @@ defmodule SymphonyElixir.LinearAgentTest do
              }
            }}
 
+        payload["query"] =~ "SymphonyClearIssueDelegate" ->
+          send(test_pid, {:delegate_cleared, payload["variables"]["issueId"]})
+
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "data" => %{
+                 "issueUpdate" => %{
+                   "success" => true,
+                   "issue" => %{"id" => "issue-orphaned", "delegate" => nil}
+                 }
+               }
+             }
+           }}
+
         true ->
           flunk("unexpected GraphQL operation")
       end
@@ -1026,6 +1070,7 @@ defmodule SymphonyElixir.LinearAgentTest do
                    1_000
 
     assert close_message =~ "No worker is currently running"
+    assert_receive {:delegate_cleared, "issue-orphaned"}, 1_000
     assert AgentBridge.session_for_issue("issue-eligible", bridge_name) == "session-eligible"
 
     assert :ok = AgentBridge.reconcile_open_sessions([], bridge_name)
