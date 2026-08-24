@@ -263,15 +263,13 @@ defmodule SymphonyElixir.Linear.AgentBridge do
         {:reply, :disabled, state}
 
       agent_session_id ->
-        proof_body =
-          "#{safe_activity_text(caption, 1_000)}\n\n" <>
-            "![#{escape_alt_text(caption)}](#{asset_url})"
+        safe_caption = safe_activity_text(caption, 1_000)
 
         content = %{
-          "type" => "action",
-          "action" => "Screenshot proof",
-          "parameter" => safe_activity_text(caption, 240),
-          "result" => proof_body
+          "type" => "thought",
+          "body" =>
+            "Screenshot proof: #{safe_caption}\n\n" <>
+              "![#{escape_alt_text(caption)}](#{asset_url})"
         }
 
         case create_activity(state, agent_session_id, content) do

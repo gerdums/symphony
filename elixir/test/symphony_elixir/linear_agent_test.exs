@@ -603,10 +603,8 @@ defmodule SymphonyElixir.LinearAgentTest do
     assert_received {:activity,
                      %{
                        "content" => %{
-                         "type" => "action",
-                         "action" => "Screenshot proof",
-                         "parameter" => "The updated screen",
-                         "result" => "The updated screen\n\n![The updated screen](https://uploads.linear.app/private-proof)"
+                         "type" => "thought",
+                         "body" => "Screenshot proof: The updated screen\n\n![The updated screen](https://uploads.linear.app/private-proof)"
                        }
                      }}
 
