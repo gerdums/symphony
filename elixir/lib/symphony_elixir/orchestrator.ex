@@ -622,7 +622,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_stalled_running_issues(%State{} = state) do
-    timeout_ms = Config.settings!().codex.stall_timeout_ms
+    timeout_ms = Config.agent_stall_timeout_ms()
 
     cond do
       timeout_ms <= 0 ->
@@ -656,7 +656,7 @@ defmodule SymphonyElixir.Orchestrator do
       session_id = running_entry_session_id(running_entry)
 
       if input_required_blocker?(running_entry) do
-        error = blocker_error(running_entry, "stalled for #{elapsed_ms}ms after Codex requested operator input")
+        error = blocker_error(running_entry, "stalled for #{elapsed_ms}ms after the agent requested operator input")
 
         Logger.warning("Issue blocked: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; #{error}")
 
@@ -673,7 +673,7 @@ defmodule SymphonyElixir.Orchestrator do
         |> schedule_issue_retry(issue_id, next_attempt, %{
           identifier: identifier,
           issue_url: running_entry.issue.url,
-          error: "stalled for #{elapsed_ms}ms without codex activity"
+          error: "stalled for #{elapsed_ms}ms without agent activity"
         })
       end
     else
@@ -1018,6 +1018,8 @@ defmodule SymphonyElixir.Orchestrator do
             worker_host: worker_host,
             workspace_path: nil,
             session_id: nil,
+            agent_provider: Config.settings!().agent.provider,
+            agent_process_pid: nil,
             last_codex_message: nil,
             last_codex_timestamp: nil,
             last_codex_event: nil,
@@ -1517,6 +1519,8 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: metadata.session_id,
+          agent_provider: Map.get(metadata, :agent_provider),
+          agent_process_pid: Map.get(metadata, :agent_process_pid),
           codex_app_server_pid: metadata.codex_app_server_pid,
           codex_input_tokens: metadata.codex_input_tokens,
           codex_output_tokens: metadata.codex_output_tokens,
@@ -1606,6 +1610,8 @@ defmodule SymphonyElixir.Orchestrator do
     codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
     codex_total_tokens = Map.get(running_entry, :codex_total_tokens, 0)
     codex_app_server_pid = Map.get(running_entry, :codex_app_server_pid)
+    agent_process_pid = Map.get(running_entry, :agent_process_pid)
+    agent_provider = Map.get(running_entry, :agent_provider)
     last_reported_input = Map.get(running_entry, :codex_last_reported_input_tokens, 0)
     last_reported_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
@@ -1616,6 +1622,8 @@ defmodule SymphonyElixir.Orchestrator do
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
+        agent_provider: Map.get(update, :agent_provider, agent_provider),
+        agent_process_pid: agent_process_pid_for_update(agent_process_pid, update),
         last_codex_event: event,
         run_outcome: Map.get(update, :outcome, Map.get(running_entry, :run_outcome)),
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
@@ -1644,10 +1652,30 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp codex_app_server_pid_for_update(existing, _update), do: existing
 
+  defp agent_process_pid_for_update(_existing, %{agent_process_pid: pid})
+       when is_binary(pid),
+       do: pid
+
+  defp agent_process_pid_for_update(_existing, %{agent_process_pid: pid})
+       when is_integer(pid),
+       do: Integer.to_string(pid)
+
+  defp agent_process_pid_for_update(_existing, %{agent_process_pid: pid}) when is_list(pid),
+    do: to_string(pid)
+
+  defp agent_process_pid_for_update(existing, _update), do: existing
+
   defp session_id_for_update(_existing, %{session_id: session_id}) when is_binary(session_id),
     do: session_id
 
   defp session_id_for_update(existing, _update), do: existing
+
+  defp turn_count_for_update(existing_count, _existing_session_id, %{
+         event: :session_started,
+         turn_number: turn_number
+       })
+       when is_integer(existing_count) and is_integer(turn_number) and turn_number > 0,
+       do: max(existing_count, turn_number)
 
   defp turn_count_for_update(existing_count, existing_session_id, %{
          event: :session_started,
@@ -1668,11 +1696,16 @@ defmodule SymphonyElixir.Orchestrator do
   defp turn_count_for_update(_existing_count, _existing_session_id, _update), do: 0
 
   defp summarize_codex_update(update) do
-    %{
+    summary = %{
       event: update[:event],
       message: update[:payload] || update[:raw],
       timestamp: update[:timestamp]
     }
+
+    case update[:agent_provider] do
+      nil -> summary
+      provider -> Map.put(summary, :provider, provider)
+    end
   end
 
   defp schedule_tick(%State{} = state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
@@ -1847,6 +1880,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     Enum.find_value(payloads, &absolute_token_usage_from_payload/1) ||
       Enum.find_value(payloads, &turn_completed_usage_from_payload/1) ||
+      Enum.find(payloads, fn payload -> is_map(payload) and integer_token_map?(payload) end) ||
       %{}
   end
 

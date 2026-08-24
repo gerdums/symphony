@@ -6,7 +6,9 @@ defmodule SymphonyElixir.TestSupport do
       use ExUnit.Case
       import ExUnit.CaptureLog
 
+      alias SymphonyElixir.AgentClient
       alias SymphonyElixir.AgentRunner
+      alias SymphonyElixir.Claude.CLI, as: ClaudeCLI
       alias SymphonyElixir.CLI
       alias SymphonyElixir.Codex.AppServer
       alias SymphonyElixir.Config
@@ -106,6 +108,7 @@ defmodule SymphonyElixir.TestSupport do
           worker_ssh_hosts: [],
           worker_include_local: false,
           worker_max_concurrent_agents_per_host: nil,
+          agent_provider: "codex",
           linear_agent_enabled: false,
           linear_agent_display_name: "Symphony Agent",
           linear_agent_endpoint: "https://api.linear.app/graphql",
@@ -131,6 +134,9 @@ defmodule SymphonyElixir.TestSupport do
           codex_turn_timeout_ms: 3_600_000,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
+          claude_command: "claude",
+          claude_turn_timeout_ms: 3_600_000,
+          claude_stall_timeout_ms: 300_000,
           hook_after_create: nil,
           hook_before_run: nil,
           hook_after_run: nil,
@@ -161,6 +167,7 @@ defmodule SymphonyElixir.TestSupport do
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
     worker_include_local = Keyword.get(config, :worker_include_local)
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
+    agent_provider = Keyword.get(config, :agent_provider)
     linear_agent_enabled = Keyword.get(config, :linear_agent_enabled)
     linear_agent_display_name = Keyword.get(config, :linear_agent_display_name)
     linear_agent_endpoint = Keyword.get(config, :linear_agent_endpoint)
@@ -186,6 +193,9 @@ defmodule SymphonyElixir.TestSupport do
     codex_turn_timeout_ms = Keyword.get(config, :codex_turn_timeout_ms)
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
+    claude_command = Keyword.get(config, :claude_command)
+    claude_turn_timeout_ms = Keyword.get(config, :claude_turn_timeout_ms)
+    claude_stall_timeout_ms = Keyword.get(config, :claude_stall_timeout_ms)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
@@ -234,6 +244,7 @@ defmodule SymphonyElixir.TestSupport do
           max_file_bytes: linear_agent_max_file_bytes
         }),
         "agent:",
+        "  provider: #{yaml_value(agent_provider)}",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
@@ -246,6 +257,10 @@ defmodule SymphonyElixir.TestSupport do
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
+        "claude:",
+        "  command: #{yaml_value(claude_command)}",
+        "  turn_timeout_ms: #{yaml_value(claude_turn_timeout_ms)}",
+        "  stall_timeout_ms: #{yaml_value(claude_stall_timeout_ms)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),

@@ -16,24 +16,25 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 1. Polls the configured tracker for candidate work (included adapters: Linear, GitHub Issues, Jira
    Cloud, Asana, and GitLab)
 2. Creates a workspace per issue
-3. Launches Codex in [App Server mode](https://developers.openai.com/codex/app-server/) inside the
-   workspace
-4. Sends a workflow prompt to Codex
-5. Keeps Codex working on the issue until the work is done
+3. Launches the configured coding-agent provider inside the workspace: Codex in
+   [App Server mode](https://developers.openai.com/codex/app-server/) or Claude Code in print mode
+4. Sends the workflow prompt to the selected provider
+5. Keeps the selected provider working on the issue until the work is done
 
-During app-server sessions, the selected tracker adapter may advertise provider-native tools. The
+During Codex app-server sessions, the selected tracker adapter may advertise provider-native tools.
 Linear serves `linear_graphql`, GitHub Issues serves `github_api`, Jira Cloud serves
 `jira_rest`, Asana serves `asana_api`, and GitLab serves `gitlab_api`. Symphony executes those
 tools with configured host-side auth and removes declared tracker-token environment variables from
-the Codex child, so the agent does not need a second tracker login.
+the Codex child, so the agent does not need a second tracker login. Claude Code does not speak the
+app-server protocol, so its tracker tools must instead be configured as Claude MCP servers.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
 
-If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
-issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
-entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
-tracker issue can become a dispatch candidate again after restart.
+If the provider reports that operator input, approval, or MCP elicitation is required, Symphony
+keeps the issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard.
+Blocked entries are in memory only; restarting the orchestrator clears that blocked map, so any
+still-active tracker issue can become a dispatch candidate again after restart.
 
 ## How to use it
 
@@ -78,7 +79,8 @@ mise exec -- ./bin/symphony ./WORKFLOW.md
 
 Symphony ships self-contained executables built with
 [Burrito](https://github.com/burrito-elixir/burrito). They embed Erlang/OTP, Elixir, and Symphony,
-but still expect `codex`, `git`, and the selected tracker credentials on the target machine.
+but still expect `git`, the selected provider executable (`codex` or `claude`), and the selected
+tracker credentials on the target machine.
 
 Supported release targets:
 
@@ -113,7 +115,7 @@ Optional flags:
 - `--port` also starts the Phoenix observability service (default: disabled)
 
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
-Codex session prompt.
+coding-agent session prompt.
 
 Minimal example:
 
@@ -129,6 +131,7 @@ hooks:
   after_create: |
     git clone git@github.com:your-org/your-repo.git .
 agent:
+  provider: codex
   max_concurrent_agents: 10
   max_turns: 20
 codex:
@@ -143,6 +146,8 @@ Title: {{ issue.title }} Body: {{ issue.description }}
 Notes:
 
 - If a value is missing, defaults are used.
+- `agent.provider` selects `codex` (the default) or `claude`. Other values fail workflow
+  validation.
 - `tracker.kind` selects an adapter. Adapter-owned endpoint, scope, and auth settings belong under
   `tracker.provider`; the current Linear adapter still accepts the older flat `endpoint`,
   `api_key`, `project_slug`, and `assignee` aliases for compatibility.
@@ -168,7 +173,7 @@ Notes:
 - Workflows that run package managers or other commands that resolve external hosts should set
   `networkAccess: true` in `codex.turn_sandbox_policy`; otherwise DNS/network access may be denied
   by the Codex turn sandbox.
-- `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
+- `agent.max_turns` caps how many back-to-back provider turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
@@ -204,6 +209,40 @@ codex:
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+
+### Claude Code provider
+
+Select Claude Code with validated `agent.provider` and `claude` settings:
+
+```yaml
+agent:
+  provider: claude
+  max_turns: 20
+claude:
+  command: claude
+  turn_timeout_ms: 3600000
+  stall_timeout_ms: 300000
+```
+
+Symphony launches `claude -p` once per turn in the issue workspace and always adds
+`--output-format stream-json --verbose`. It captures Claude's native `session_id` from the JSONL
+stream and adds `--resume <session_id>` to continuation turns. `claude.command` may include normal
+Claude CLI options, such as a model, permission mode, or `--mcp-config`; it must not point to a
+Codex app-server compatibility shim. `claude.turn_timeout_ms` is the maximum interval with no
+stdout/stderr stream activity, and `claude.stall_timeout_ms` controls the orchestrator's independent
+no-event restart threshold. Set the latter to `0` to disable orchestrator stall detection.
+
+Symphony does not inject its Codex dynamic tracker tools into Claude. Configure equivalent tracker
+servers in Claude Code's user settings, a workspace `.mcp.json`, or with `--mcp-config` in
+`claude.command`, and verify them with `claude mcp list` on every local or SSH worker that can run
+issues. The MCP server must expose the tracker operations required by the workflow prompt.
+
+Tracker credentials in `tracker.provider` are not converted into Claude MCP configuration. Symphony
+also removes the tracker adapter's declared secret environment names from the Claude child, as it
+does for Codex. Supply MCP authentication independently through host-only Claude/MCP configuration
+or a credential wrapper; do not commit literal tokens to `WORKFLOW.md` or `.mcp.json`. On SSH
+workers, the Claude executable, session storage, MCP configuration, and MCP credentials must all be
+installed on the remote worker because continuation uses that worker's `--resume` state.
 
 ### Native Linear agent sessions
 

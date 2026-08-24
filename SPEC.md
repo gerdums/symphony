@@ -105,7 +105,7 @@ Important boundary:
 6. `Agent Runner`
    - Creates workspace.
    - Builds prompt from issue + workflow template.
-   - Launches the coding agent app-server client.
+   - Launches the configured coding-agent client.
    - Streams agent updates back to the orchestrator.
 
 7. `Status Surface` (OPTIONAL)
@@ -145,7 +145,7 @@ Symphony is easiest to port when kept in these layers:
 - One configured issue tracker API.
 - Local filesystem for workspaces and logs.
 - OPTIONAL workspace population tooling (for example Git CLI, if used).
-- Coding-agent executable that supports the targeted Codex app-server mode.
+- Coding-agent executable supported by the selected provider.
 - Host environment authentication for the issue tracker and coding agent. Host-side tracker secret
   environment variables SHOULD NOT be inherited by the coding-agent child process.
 
@@ -248,9 +248,11 @@ State tracked while a coding-agent subprocess is running.
 
 Fields:
 
-- `session_id` (string, `<thread_id>-<turn_id>`)
-- `thread_id` (string)
-- `turn_id` (string)
+- `session_id` (provider-native string; Codex uses `<thread_id>-<turn_id>`)
+- `agent_provider` (`codex` or `claude`)
+- `agent_process_pid` (string or null)
+- `thread_id` (Codex string or null)
+- `turn_id` (Codex string or null)
 - `codex_app_server_pid` (string or null)
 - `last_codex_event` (string/enum or null)
 - `last_codex_timestamp` (timestamp or null)
@@ -362,6 +364,7 @@ Top-level keys:
 - `hooks`
 - `agent`
 - `codex`
+- `claude`
 
 Unknown keys SHOULD be ignored for forward compatibility.
 
@@ -445,6 +448,11 @@ Fields:
 
 Fields:
 
+- `provider` (string)
+  - Default: `codex`
+  - Supported values in the Elixir implementation: `codex`, `claude`.
+  - Invalid values fail configuration validation.
+
 - `max_concurrent_agents` (integer)
   - Default: `10`
   - Changes SHOULD be re-applied at runtime and affect subsequent dispatch decisions.
@@ -489,6 +497,26 @@ fields locally if they want stricter startup checks.
 - `stall_timeout_ms` (integer)
   - Default: `300000` (5 minutes)
   - If `<= 0`, stall detection is disabled.
+
+#### 5.3.7 `claude` (object)
+
+Fields:
+
+- `command` (string shell command)
+  - Default: `claude`.
+  - The runtime appends `-p --output-format stream-json --verbose` and the turn prompt.
+  - Continuation turns also receive `--resume <session_id>` using the native ID captured from the
+    prior JSONL stream.
+- `turn_timeout_ms` (integer)
+  - Default: `3600000` (1 hour).
+  - Maximum silence between stream events, not a total turn runtime cap.
+- `stall_timeout_ms` (integer)
+  - Default: `300000` (5 minutes).
+  - If `<= 0`, orchestrator stall detection is disabled.
+
+Claude Code is a separate CLI provider. Implementations MUST consume its JSONL output directly and
+MUST NOT represent it as a Codex app-server protocol peer. Tracker tools for Claude MUST be supplied
+through Claude MCP configuration; Codex dynamic tools are not portable to this provider.
 
 ### 5.4 Prompt Template Contract
 
@@ -600,7 +628,7 @@ Validation checks:
 - `tracker.kind` is present and supported.
 - The selected adapter accepts `tracker.provider` after documented defaults and `$VAR`
   resolution.
-- `codex.command` is present and non-empty.
+- The selected provider's `command` is present and non-empty.
 
 ### 6.4 Core Config Fields Summary (Cheat Sheet)
 
@@ -621,6 +649,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `hooks.before_remove`: shell script or null
 - `hooks.timeout_ms`: integer, default `60000`
 - `agent.max_concurrent_agents`: integer, default `10`
+- `agent.provider`: `codex` or `claude`, default `codex`
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
@@ -631,6 +660,9 @@ not require recognizing or validating extension fields unless that extension is 
 - `codex.turn_timeout_ms`: integer, default `3600000`
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`
+- `claude.command`: shell command string, default `claude`
+- `claude.turn_timeout_ms`: integer, default `3600000`
+- `claude.stall_timeout_ms`: integer, default `300000`
 
 ## 7. Orchestration State Machine
 
@@ -710,7 +742,7 @@ Distinct terminal reasons are important because retry logic and logs differ.
   - Update aggregate runtime totals.
   - Schedule exponential-backoff retry.
 
-- `Codex Update Event`
+- `Agent Update Event`
   - Update live session fields, token counters, and rate limits.
 
 - `Retry Timer Fired`
@@ -949,9 +981,11 @@ Invariant 3: Workspace key is sanitized.
 
 ## 10. Agent Runner Protocol (Coding Agent Integration)
 
-This section defines Symphony's language-neutral responsibilities when integrating a Codex
-app-server. The Codex app-server protocol for the targeted Codex version is the source of truth for
-protocol schemas, message payloads, transport framing, and method names.
+The runner calls a provider-neutral agent-client behavior with `start_session`, `run_turn`, and
+`stop_session`. Each provider owns its native session representation and translates its output into
+the common orchestrator event model. The following app-server requirements apply to the Codex
+provider. The Codex app-server protocol for the targeted Codex version remains the source of truth
+for protocol schemas, message payloads, transport framing, and method names.
 
 Protocol source of truth:
 
@@ -1038,11 +1072,13 @@ Transport handling requirements:
 
 ### 10.4 Emitted Runtime Events (Upstream to Orchestrator)
 
-The app-server client emits structured events to the orchestrator callback. Each event SHOULD
+Each agent client emits structured events to the orchestrator callback. Each event SHOULD
 include:
 
 - `event` (enum/string)
 - `timestamp` (UTC timestamp)
+- `agent_provider`
+- `agent_process_pid` (if available)
 - `codex_app_server_pid` (if available)
 - OPTIONAL `usage` map (token counts)
 - payload fields as needed
@@ -1162,19 +1198,33 @@ Error mapping (RECOMMENDED normalized categories):
 
 ### 10.7 Agent Runner Contract
 
-The `Agent Runner` wraps workspace + prompt + app-server client.
+The `Agent Runner` wraps workspace + prompt + the selected agent client.
 
 Behavior:
 
 1. Create/reuse workspace for issue.
 2. Build prompt from workflow template.
-3. Start app-server session.
-4. Forward app-server events to orchestrator.
+3. Start the provider session.
+4. Forward provider events to the orchestrator.
 5. On any error, fail the worker attempt (the orchestrator will retry).
 
 Note:
 
 - Workspaces are intentionally preserved after successful runs.
+
+### 10.8 Claude Code CLI Contract
+
+The Claude provider MUST launch a separate `claude -p --output-format stream-json --verbose`
+process for every turn with the issue workspace as cwd. It MUST parse Claude's newline-delimited
+JSON directly, capture the native `session_id`, and pass `--resume <session_id>` on later turns in
+the same worker run. It MUST NOT send Codex JSON-RPC messages to Claude or describe Claude as an
+app-server.
+
+The provider maps the final `result` record, `permission_denials`, process exit status,
+cancellation, malformed protocol-shaped lines, and stream silence into the common events above.
+Non-terminal Claude records become `notification` events, while successful results carry the
+native usage map when present. Tracker tools are not injected through the Codex dynamic-tool
+channel; workflows using Claude MUST arrange equivalent tools through Claude MCP configuration.
 
 ## 11. Issue Tracker Integration Contract
 
@@ -1940,7 +1990,8 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
   if run_hook("before_run", workspace.path) failed:
     fail_worker("before_run hook error")
 
-  session = app_server.start_session(workspace=workspace.path)
+  agent_client = configured_agent_client(config.agent.provider)
+  session = agent_client.start_session(workspace=workspace.path)
   if session failed:
     run_hook_best_effort("after_run", workspace.path)
     fail_worker("agent session startup error")
@@ -1951,11 +2002,11 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
   while true:
     prompt = build_turn_prompt(workflow_template, issue, attempt, turn_number, max_turns)
     if prompt failed:
-      app_server.stop_session(session)
+      agent_client.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("prompt error")
 
-    turn_result = app_server.run_turn(
+    turn_result = agent_client.run_turn(
       session=session,
       prompt=prompt,
       issue=issue,
@@ -1963,13 +2014,13 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
     )
 
     if turn_result failed:
-      app_server.stop_session(session)
+      agent_client.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("agent turn error")
 
     refreshed_issue = tracker.fetch_issues_by_ids([issue.id])
     if refreshed_issue failed:
-      app_server.stop_session(session)
+      agent_client.stop_session(session)
       run_hook_best_effort("after_run", workspace.path)
       fail_worker("issue state refresh error")
 
@@ -1986,7 +2037,7 @@ function run_agent_attempt(issue, attempt, orchestrator_channel):
 
     turn_number = turn_number + 1
 
-  app_server.stop_session(session)
+  agent_client.stop_session(session)
   run_hook_best_effort("after_run", workspace.path)
 
   exit_normal()

@@ -17,7 +17,34 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.active_states == ["Todo", "In Progress"]
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
+    assert config.agent.provider == "codex"
     assert config.agent.max_turns == 20
+    assert config.claude.command == "claude"
+    assert config.claude.turn_timeout_ms == 3_600_000
+    assert config.claude.stall_timeout_ms == 300_000
+    assert AgentClient.provider_module() == AppServer
+
+    write_workflow_file!(Workflow.workflow_file_path(), agent_provider: "claude")
+    assert Config.settings!().agent.provider == "claude"
+    assert AgentClient.provider_module() == ClaudeCLI
+
+    write_workflow_file!(Workflow.workflow_file_path(), agent_provider: "other")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.provider"
+    assert message =~ "is invalid"
+
+    write_workflow_file!(Workflow.workflow_file_path(), claude_command: "   ")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "claude.command"
+    assert message =~ "can't be blank"
+
+    write_workflow_file!(Workflow.workflow_file_path(), claude_turn_timeout_ms: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "claude.turn_timeout_ms"
+
+    write_workflow_file!(Workflow.workflow_file_path(), claude_stall_timeout_ms: -1)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "claude.stall_timeout_ms"
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -119,6 +146,14 @@ defmodule SymphonyElixir.CoreTest do
     assert is_binary(get_in(tracker, ["provider", "project_slug"]))
     assert is_list(Map.get(tracker, "active_states"))
     assert is_list(Map.get(tracker, "terminal_states"))
+
+    agent = Map.get(config, "agent", %{})
+    assert Map.get(agent, "provider") == "codex"
+
+    claude = Map.get(config, "claude", %{})
+    assert Map.get(claude, "command") == "claude"
+    assert Map.get(claude, "turn_timeout_ms") == 3_600_000
+    assert Map.get(claude, "stall_timeout_ms") == 300_000
 
     hooks = Map.get(config, "hooks", %{})
     assert is_map(hooks)

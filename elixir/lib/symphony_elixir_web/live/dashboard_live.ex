@@ -216,7 +216,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
           <div class="section-header">
             <div>
               <h2 class="section-title">Blocked sessions</h2>
-              <p class="section-copy">Issues paused because Codex requested operator input or approval.</p>
+              <p class="section-copy">Issues paused because the coding agent requested operator input or approval.</p>
             </div>
           </div>
 
