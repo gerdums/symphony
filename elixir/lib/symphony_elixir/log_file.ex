@@ -9,6 +9,7 @@ defmodule SymphonyElixir.LogFile do
   @default_log_relative_path "log/symphony.log"
   @default_max_bytes 10 * 1024 * 1024
   @default_max_files 5
+  @default_log_level :info
 
   @spec default_log_file() :: Path.t()
   def default_log_file do
@@ -25,11 +26,12 @@ defmodule SymphonyElixir.LogFile do
     log_file = Application.get_env(:symphony_elixir, :log_file, default_log_file())
     max_bytes = Application.get_env(:symphony_elixir, :log_file_max_bytes, @default_max_bytes)
     max_files = Application.get_env(:symphony_elixir, :log_file_max_files, @default_max_files)
+    log_level = Application.get_env(:symphony_elixir, :log_file_level, @default_log_level)
 
-    setup_disk_handler(log_file, max_bytes, max_files)
+    setup_disk_handler(log_file, max_bytes, max_files, log_level)
   end
 
-  defp setup_disk_handler(log_file, max_bytes, max_files) do
+  defp setup_disk_handler(log_file, max_bytes, max_files, log_level) do
     expanded_path = Path.expand(log_file)
     :ok = File.mkdir_p(Path.dirname(expanded_path))
     :ok = remove_existing_handler()
@@ -37,7 +39,7 @@ defmodule SymphonyElixir.LogFile do
     case :logger.add_handler(
            @handler_id,
            :logger_disk_log_h,
-           disk_log_handler_config(expanded_path, max_bytes, max_files)
+           disk_log_handler_config(expanded_path, max_bytes, max_files, log_level)
          ) do
       :ok ->
         remove_default_console_handler()
@@ -65,9 +67,9 @@ defmodule SymphonyElixir.LogFile do
     end
   end
 
-  defp disk_log_handler_config(path, max_bytes, max_files) do
+  defp disk_log_handler_config(path, max_bytes, max_files, log_level) do
     %{
-      level: :all,
+      level: log_level,
       formatter: {:logger_formatter, %{single_line: true}},
       config: %{
         file: String.to_charlist(path),

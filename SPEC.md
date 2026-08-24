@@ -1386,6 +1386,10 @@ REQUIRED context for coding-agent session lifecycle logs:
 
 - `session_id`
 
+Raw webhook request bodies and parsed webhook parameters MUST NOT be written to persistent logs.
+Persistent logging SHOULD default to `info` or a higher level so framework debug request logs cannot
+capture ticket descriptions, comments, or other user-provided payloads.
+
 Message formatting requirements:
 
 - Use stable `key=value` phrasing.
