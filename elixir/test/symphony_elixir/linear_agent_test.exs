@@ -1123,6 +1123,9 @@ defmodule SymphonyElixir.LinearAgentTest do
     assert_receive {:delegate_cleared, "issue-orphaned"}, 1_000
     assert AgentBridge.session_for_issue("issue-eligible", bridge_name) == "session-eligible"
 
+    assert {:ok, "session-eligible"} =
+             AgentBridge.ensure_session(%Issue{id: "issue-eligible"}, bridge_name)
+
     assert :ok = AgentBridge.reconcile_open_sessions([], bridge_name)
     refute_receive :open_session_reconciliation, 100
   end

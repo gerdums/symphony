@@ -74,7 +74,7 @@ defmodule SymphonyElixir.Linear.AgentBridge do
         _ -> []
       end)
 
-    GenServer.cast(server, {:reconcile_open_sessions, MapSet.new(issue_ids)})
+    GenServer.call(server, {:reconcile_open_sessions, MapSet.new(issue_ids)}, 60_000)
   end
 
   @spec start_work(Issue.t(), GenServer.server()) :: :ok | {:error, term()} | :disabled
@@ -189,6 +189,28 @@ defmodule SymphonyElixir.Linear.AgentBridge do
           {:ok, session_id, state} -> {:reply, {:ok, session_id}, state}
           {:error, reason, state} -> {:reply, {:error, reason}, state}
         end
+    end
+  end
+
+  def handle_call({:reconcile_open_sessions, eligible_issue_ids}, _from, state) do
+    settings = Config.settings!()
+
+    cond do
+      !settings.linear_agent.enabled ->
+        {:reply, :ok, state}
+
+      state.open_session_reconciliation != :pending ->
+        {:reply, :ok, state}
+
+      true ->
+        result =
+          state.client.list_open_sessions(
+            settings.linear_agent.app_user_id,
+            settings.tracker.project_slug,
+            client_opts(state)
+          )
+
+        {:reply, :ok, reconcile_open_session_result(state, eligible_issue_ids, result)}
     end
   end
 
@@ -353,35 +375,6 @@ defmodule SymphonyElixir.Linear.AgentBridge do
     end
   end
 
-  def handle_cast({:reconcile_open_sessions, eligible_issue_ids}, state) do
-    settings = Config.settings!()
-
-    cond do
-      !settings.linear_agent.enabled ->
-        {:noreply, state}
-
-      state.open_session_reconciliation != :pending ->
-        {:noreply, state}
-
-      true ->
-        bridge = self()
-
-        {:ok, _pid} =
-          Task.start(fn ->
-            result =
-              state.client.list_open_sessions(
-                settings.linear_agent.app_user_id,
-                settings.tracker.project_slug,
-                client_opts(state)
-              )
-
-            send(bridge, {:open_session_reconciliation_result, eligible_issue_ids, result})
-          end)
-
-        {:noreply, %{state | open_session_reconciliation: :running}}
-    end
-  end
-
   def handle_cast({:setup_repair_started, issue_id, attempt, total}, state) do
     publish_issue_activity_async(state, issue_id, %{
       "type" => "thought",
@@ -481,8 +474,8 @@ defmodule SymphonyElixir.Linear.AgentBridge do
     end
   end
 
-  def handle_info({:open_session_reconciliation_result, eligible_issue_ids, {:ok, sessions}}, state)
-      when is_list(sessions) do
+  defp reconcile_open_session_result(state, eligible_issue_ids, {:ok, sessions})
+       when is_list(sessions) do
     state =
       Enum.reduce(sessions, state, fn
         %{"id" => session_id, "issue" => %{"id" => issue_id}}, state_acc
@@ -498,17 +491,17 @@ defmodule SymphonyElixir.Linear.AgentBridge do
           state_acc
       end)
 
-    {:noreply, %{state | open_session_reconciliation: :complete}}
+    %{state | open_session_reconciliation: :complete}
   end
 
-  def handle_info({:open_session_reconciliation_result, _eligible_issue_ids, {:error, reason}}, state) do
+  defp reconcile_open_session_result(state, _eligible_issue_ids, {:error, reason}) do
     Logger.warning("Unable to reconcile open Linear agent sessions after restart: #{inspect(reason)}")
-    {:noreply, %{state | open_session_reconciliation: :complete}}
+    %{state | open_session_reconciliation: :complete}
   end
 
-  def handle_info({:open_session_reconciliation_result, _eligible_issue_ids, other}, state) do
+  defp reconcile_open_session_result(state, _eligible_issue_ids, other) do
     Logger.warning("Invalid open Linear agent session reconciliation response: #{inspect(other)}")
-    {:noreply, %{state | open_session_reconciliation: :complete}}
+    %{state | open_session_reconciliation: :complete}
   end
 
   defp publish_codex_update(state, agent_session_id, update) do
