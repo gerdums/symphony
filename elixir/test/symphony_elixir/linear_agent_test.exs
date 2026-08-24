@@ -333,8 +333,35 @@ defmodule SymphonyElixir.LinearAgentTest do
              AgentClient.list_open_sessions("app-user", "project", request_fun: request_fun)
 
     assert Enum.map(sessions, & &1["id"]) == ["session-page-1", "session-page-2"]
-    assert_received {:session_page, nil}
-    assert_received {:session_page, "next-page"}
+    assert_receive {:session_page, nil}
+    assert_receive {:session_page, "next-page"}
+  end
+
+  test "agent client includes archived sessions so stale delegations can be reconciled" do
+    test_pid = self()
+
+    request_fun = fn payload, _headers ->
+      send(test_pid, {:archived_session_query, payload["query"]})
+
+      {:ok,
+       %{
+         status: 200,
+         body: %{
+           "data" => %{
+             "agentSessions" => %{
+               "nodes" => [],
+               "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+             }
+           }
+         }
+       }}
+    end
+
+    assert {:ok, []} =
+             AgentClient.list_open_sessions("app-user", "project", request_fun: request_fun)
+
+    assert_receive {:archived_session_query, query}
+    assert query =~ "includeArchived: true"
   end
 
   test "agent client prepares a private upload and puts the exact bytes" do

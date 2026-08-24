@@ -30,7 +30,7 @@ defmodule SymphonyElixir.Linear.AgentClient do
   """
   @list_sessions_query """
   query SymphonyListAgentSessions($first: Int!, $after: String) {
-    agentSessions(first: $first, after: $after) {
+    agentSessions(first: $first, after: $after, includeArchived: true) {
       nodes {
         id
         status
