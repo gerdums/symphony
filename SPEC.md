@@ -2336,8 +2336,9 @@ the execution coordinator.
 Extension config:
 
 - `linear_agent.enabled` (boolean, default `false`)
-- `linear_agent.assign_on_start` (boolean, default `false`; assign the issue to the configured app
-  user after a worker slot is admitted and before workspace preparation begins)
+- `linear_agent.assign_on_start` (boolean, default `false`; delegate the issue to the configured app
+  user through Linear's agent `delegate` field after a worker slot is admitted and before workspace
+  preparation begins; the human `assignee` field remains unchanged)
   - `SYMPHONY_LINEAR_AGENT_ENABLED` MAY override this in host-private deployment configuration.
 - `linear_agent.display_name` (string or `$VAR`, default `Symphony Agent`)
 - `linear_agent.endpoint` (URL, default `https://api.linear.app/graphql`)
@@ -2367,7 +2368,9 @@ the workflow.
   SHOULD create or reuse its native session and publish a durable waiting plan/activity. The issue
   MUST remain unassigned until a worker slot is actually admitted.
 - Admission SHOULD update the same session to workspace preparation. When assignment-on-start is
-  enabled, the app-user assignment MUST succeed before setup or coding work begins.
+  enabled, delegation to the app user MUST succeed before setup or coding work begins.
+- Repeated failures for one ticket SHOULD be coalesced so a retry loop does not emit duplicate native
+  stop/error notifications while the same session remains active.
 - The webhook endpoint MUST verify `Linear-Signature` against the raw body using HMAC-SHA256 and
   SHOULD reject stale `webhookTimestamp` values.
 - A `created` event SHOULD register the supplied session and queue its `promptContext`.

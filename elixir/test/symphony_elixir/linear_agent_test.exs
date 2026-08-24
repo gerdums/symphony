@@ -54,7 +54,7 @@ defmodule SymphonyElixir.LinearAgentTest do
     refute Map.has_key?(payload["variables"]["input"], "externalUrls")
   end
 
-  test "agent client assigns an issue to the OAuth app user" do
+  test "agent client delegates an issue to the OAuth app user" do
     test_pid = self()
 
     request_fun = fn payload, _headers ->
@@ -67,18 +67,18 @@ defmodule SymphonyElixir.LinearAgentTest do
            "data" => %{
              "issueUpdate" => %{
                "success" => true,
-               "issue" => %{"id" => "issue-1", "assignee" => %{"id" => "app-user"}}
+               "issue" => %{"id" => "issue-1", "delegate" => %{"id" => "app-user"}}
              }
            }
          }
        }}
     end
 
-    assert {:ok, %{"assignee" => %{"id" => "app-user"}}} =
+    assert {:ok, %{"delegate" => %{"id" => "app-user"}}} =
              AgentClient.assign_issue("issue-1", "app-user", request_fun: request_fun)
 
     assert_received {:assignment_request, payload}
-    assert payload["variables"] == %{"issueId" => "issue-1", "assigneeId" => "app-user"}
+    assert payload["variables"] == %{"issueId" => "issue-1", "delegateId" => "app-user"}
   end
 
   test "enabled config advertises proof and keeps all agent secrets out of the child environment" do
@@ -467,7 +467,7 @@ defmodule SymphonyElixir.LinearAgentTest do
                "data" => %{
                  "issueUpdate" => %{
                    "success" => true,
-                   "issue" => %{"id" => "issue-1", "assignee" => %{"id" => "app-user"}}
+                   "issue" => %{"id" => "issue-1", "delegate" => %{"id" => "app-user"}}
                  }
                }
              }
@@ -512,7 +512,7 @@ defmodule SymphonyElixir.LinearAgentTest do
     assert AgentBridge.session_for_issue("issue-1", bridge_name) == "session-1"
     assert :ok = AgentBridge.start_work(%Issue{id: "issue-1"}, bridge_name)
 
-    assert_received {:assignment_request, %{"issueId" => "issue-1", "assigneeId" => "app-user"}}
+    assert_received {:assignment_request, %{"issueId" => "issue-1", "delegateId" => "app-user"}}
     assert_received {:session_update, %{"id" => "session-1", "input" => %{"plan" => [plan]}}}
     assert plan["content"] == "Preparing the ticket workspace"
   end
@@ -605,6 +605,65 @@ defmodule SymphonyElixir.LinearAgentTest do
                          ]
                        }
                      }}
+  end
+
+  test "bridge publishes only one stop notification while a failed ticket retries" do
+    test_pid = self()
+
+    request_fun = fn payload, _headers ->
+      if payload["query"] =~ "SymphonyCreateAgentActivity" do
+        send(test_pid, {:activity, payload["variables"]["input"]})
+
+        {:ok,
+         %{
+           status: 200,
+           body: %{
+             "data" => %{
+               "agentActivityCreate" => %{
+                 "success" => true,
+                 "agentActivity" => %{"id" => "activity-1"}
+               }
+             }
+           }
+         }}
+      else
+        flunk("unexpected GraphQL operation")
+      end
+    end
+
+    bridge_name = String.to_atom("linear_agent_failure_bridge_#{System.unique_integer([:positive])}")
+
+    start_supervised!({AgentBridge, name: bridge_name, orchestrator: nil, client_opts: [request_fun: request_fun]})
+
+    assert :ok =
+             AgentBridge.accept_webhook(
+               %{
+                 "action" => "created",
+                 "webhookId" => "failure-webhook",
+                 "oauthClientId" => "oauth-client",
+                 "appUserId" => "app-user",
+                 "agentSession" => %{"id" => "session-failure", "issueId" => "issue-failure"}
+               },
+               bridge_name
+             )
+
+    assert :ok = AgentBridge.fail("issue-failure", "The worker stopped.", bridge_name)
+    assert :ok = AgentBridge.fail("issue-failure", "The worker stopped again.", bridge_name)
+
+    assert :ok =
+             AgentBridge.report_codex_update(
+               "issue-failure",
+               %{event: :turn_ended_with_error},
+               bridge_name
+             )
+
+    assert AgentBridge.session_for_issue("issue-failure", bridge_name) == "session-failure"
+
+    errors =
+      receive_activities([])
+      |> Enum.filter(&(get_in(&1, ["content", "type"]) == "error"))
+
+    assert [%{"content" => %{"body" => "The worker stopped."}}] = errors
   end
 
   test "proof tool only uploads an image contained in the current workspace" do

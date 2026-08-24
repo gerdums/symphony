@@ -45,10 +45,10 @@ defmodule SymphonyElixir.Linear.AgentClient do
   }
   """
   @assign_issue_mutation """
-  mutation SymphonyAssignIssue($issueId: String!, $assigneeId: String!) {
-    issueUpdate(id: $issueId, input: {assigneeId: $assigneeId}) {
+  mutation SymphonyAssignIssue($issueId: String!, $delegateId: String!) {
+    issueUpdate(id: $issueId, input: {delegateId: $delegateId}) {
       success
-      issue { id assignee { id } }
+      issue { id delegate { id } }
     }
   }
   """
@@ -117,9 +117,9 @@ defmodule SymphonyElixir.Linear.AgentClient do
   end
 
   @spec assign_issue(String.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
-  def assign_issue(issue_id, assignee_id, opts \\ [])
-      when is_binary(issue_id) and is_binary(assignee_id) do
-    variables = %{"issueId" => issue_id, "assigneeId" => assignee_id}
+  def assign_issue(issue_id, delegate_id, opts \\ [])
+      when is_binary(issue_id) and is_binary(delegate_id) do
+    variables = %{"issueId" => issue_id, "delegateId" => delegate_id}
 
     with {:ok, body} <- graphql(@assign_issue_mutation, variables, opts) do
       get_graphql_data(body, ["issueUpdate", "issue"])

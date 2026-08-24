@@ -23,6 +23,7 @@ defmodule SymphonyElixir.Linear.AgentBridge do
             proof_counts: %{},
             waiting_issues: MapSet.new(),
             work_started_issues: MapSet.new(),
+            failure_notified_issues: MapSet.new(),
             seen_webhooks: MapSet.new()
 
   @type state :: %__MODULE__{}
@@ -103,7 +104,7 @@ defmodule SymphonyElixir.Linear.AgentBridge do
   @spec fail(String.t(), String.t(), GenServer.server()) :: :ok
   def fail(issue_id, message, server \\ __MODULE__)
       when is_binary(issue_id) and is_binary(message) do
-    GenServer.cast(server, {:activity, issue_id, %{"type" => "error", "body" => message}, []})
+    GenServer.cast(server, {:failure, issue_id, message})
   end
 
   @spec prompt_guidance() :: String.t() | nil
@@ -314,15 +315,21 @@ defmodule SymphonyElixir.Linear.AgentBridge do
   end
 
   def handle_cast({:codex_update, issue_id, update}, state) do
-    case session_id(state, issue_id) do
-      agent_session_id when is_binary(agent_session_id) ->
-        publish_codex_update(state, agent_session_id, update)
+    {:noreply, publish_codex_update_for_issue(state, issue_id, update)}
+  end
 
-      _ ->
-        :ok
+  def handle_cast({:failure, issue_id, message}, state) do
+    if MapSet.member?(state.failure_notified_issues, issue_id) do
+      {:noreply, state}
+    else
+      publish_issue_activity(state, issue_id, %{"type" => "error", "body" => message})
+
+      {:noreply,
+       %{
+         state
+         | failure_notified_issues: MapSet.put(state.failure_notified_issues, issue_id)
+       }}
     end
-
-    {:noreply, state}
   end
 
   def handle_cast({:activity, issue_id, content, opts}, state) do
@@ -346,6 +353,60 @@ defmodule SymphonyElixir.Linear.AgentBridge do
         publish_codex_activity(state, agent_session_id, update)
     end
   end
+
+  defp publish_codex_update_for_issue(state, issue_id, update) do
+    case session_id(state, issue_id) do
+      agent_session_id when is_binary(agent_session_id) ->
+        publish_codex_update_by_failure_state(
+          state,
+          issue_id,
+          agent_session_id,
+          update,
+          failure_update?(update)
+        )
+
+      _ ->
+        state
+    end
+  end
+
+  defp publish_codex_update_by_failure_state(
+         state,
+         _issue_id,
+         agent_session_id,
+         update,
+         false
+       ) do
+    publish_codex_update(state, agent_session_id, update)
+    state
+  end
+
+  defp publish_codex_update_by_failure_state(
+         state,
+         issue_id,
+         agent_session_id,
+         update,
+         true
+       ) do
+    case MapSet.member?(state.failure_notified_issues, issue_id) do
+      true ->
+        state
+
+      false ->
+        publish_codex_update(state, agent_session_id, update)
+
+        %{
+          state
+          | failure_notified_issues: MapSet.put(state.failure_notified_issues, issue_id)
+        }
+    end
+  end
+
+  defp failure_update?(%{event: event})
+       when event in [:startup_failed, :turn_failed, :turn_ended_with_error],
+       do: true
+
+  defp failure_update?(_update), do: false
 
   defp publish_codex_activity(state, agent_session_id, update) do
     case activity_for_update(update) do
@@ -633,7 +694,7 @@ defmodule SymphonyElixir.Linear.AgentBridge do
 
   defp assign_issue_to_app(state, issue_id, app_user_id) do
     case state.client.assign_issue(issue_id, app_user_id, client_opts(state)) do
-      {:ok, %{"assignee" => %{"id" => ^app_user_id}}} ->
+      {:ok, %{"delegate" => %{"id" => ^app_user_id}}} ->
         :ok
 
       {:ok, issue} ->

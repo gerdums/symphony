@@ -301,10 +301,12 @@ are also stripped from the local Codex child environment so host topology does n
 inherited shell environment.
 
 When `linear_agent.assign_on_start` (or `SYMPHONY_LINEAR_AGENT_ASSIGN_ON_START`) is true, Symphony
-assigns the issue to the OAuth app user after a worker slot is admitted and before workspace
-preparation begins. Assignment failure prevents setup or coding from starting, so an app cannot work
-a ticket while the issue still appears assigned elsewhere. A queued ticket remains unassigned until
-capacity is actually available.
+assigns the issue to the OAuth app user through Linear's agent `delegate` field after a worker slot
+is admitted and before workspace preparation begins. The human `assignee` field is intentionally
+left unchanged because Linear models native agents as delegates. Delegation failure prevents setup
+or coding from starting. A queued ticket remains undelegated until capacity is actually available.
+Repeated failures for one ticket produce at most one native stop/error notification while Symphony
+keeps the session and retry state attached.
 
 ### Linear adapter profile
 
