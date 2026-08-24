@@ -679,6 +679,27 @@ defmodule SymphonyElixir.LinearAgentTest do
                       }
                     }},
                    1_000
+
+    assert :ok =
+             AgentBridge.report_codex_update(
+               "issue-recovering",
+               %{event: :turn_ended_with_error},
+               bridge_name
+             )
+
+    assert_receive {:session_update,
+                    %{
+                      "id" => "session-recovering",
+                      "input" => %{
+                        "plan" => [
+                          %{
+                            "content" => "Recovering the worker after a transient failure",
+                            "status" => "inProgress"
+                          }
+                        ]
+                      }
+                    }},
+                   1_000
   end
 
   test "waiting session provisioning does not block bridge state reads" do

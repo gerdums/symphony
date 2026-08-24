@@ -1031,9 +1031,12 @@ the active turn terminates.
 
 Completion conditions:
 
-- Targeted-protocol turn completion signal -> success
-- Targeted-protocol turn failure signal -> failure
-- Targeted-protocol turn cancellation signal -> failure
+- A terminal notification whose embedded turn status is `completed` -> success
+- A terminal notification whose embedded turn status is `failed` -> failure
+- A terminal notification whose embedded turn status is `interrupted` -> failure
+- Implementations MUST inspect the terminal turn status rather than treating a notification named
+  `turn/completed` as unconditional success.
+- Legacy targeted-protocol turn failure or cancellation signals -> failure
 - turn stream silence timeout (`turn_timeout_ms`) -> failure
 - subprocess exit -> failure
 

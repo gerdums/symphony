@@ -167,6 +167,81 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "turn/completed preserves a failed terminal status as an error" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-failed-completion-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-FAILED-COMPLETION")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-failed"}}}' ;;
+          4)
+            printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-failed"}}}'
+            printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-failed","turn":{"id":"turn-failed","items":[],"status":"failed","error":{"message":"context window exceeded","codexErrorInfo":"contextWindowExceeded"}}}}'
+            exit 0
+            ;;
+          *) exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-failed-completion",
+        identifier: "MT-FAILED-COMPLETION",
+        title: "Preserve failed completion status",
+        state: "In Progress"
+      }
+
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      assert {:error,
+              {:turn_failed,
+               %{
+                 status: "failed",
+                 message: "context window exceeded",
+                 codex_error_info: "contextWindowExceeded"
+               }}} =
+               AppServer.run(workspace, "exercise failure", issue, on_message: on_message)
+
+      assert_received {:app_server_message,
+                       %{
+                         event: :turn_failed,
+                         details: %{
+                           status: "failed",
+                           message: "context window exceeded",
+                           codex_error_info: "contextWindowExceeded"
+                         }
+                       }}
+
+      assert_received {:app_server_message, %{event: :turn_ended_with_error}}
+      refute_received {:app_server_message, %{event: :turn_completed}}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "follow-up prompts from a Linear agent session steer the active turn" do
     test_root =
       Path.join(

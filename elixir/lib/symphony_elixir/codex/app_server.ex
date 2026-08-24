@@ -461,8 +461,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
-        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, :turn_completed}
+        handle_turn_completed(on_message, payload, payload_string, port)
 
       {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
         emit_turn_event(
@@ -545,6 +544,43 @@ defmodule SymphonyElixir.Codex.AppServer do
           turn_context
         )
     end
+  end
+
+  defp handle_turn_completed(on_message, payload, payload_string, port) do
+    turn = get_in(payload, ["params", "turn"])
+
+    case is_map(turn) && Map.get(turn, "status") do
+      status when status in [false, nil, "completed"] ->
+        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
+        {:ok, :turn_completed}
+
+      "failed" ->
+        reason = turn_completion_reason(turn)
+        emit_turn_event(on_message, :turn_failed, payload, payload_string, port, reason)
+        {:error, {:turn_failed, reason}}
+
+      "interrupted" ->
+        reason = turn_completion_reason(turn)
+        emit_turn_event(on_message, :turn_cancelled, payload, payload_string, port, reason)
+        {:error, {:turn_cancelled, reason}}
+
+      status ->
+        reason = %{status: status}
+        emit_turn_event(on_message, :turn_failed, payload, payload_string, port, reason)
+        {:error, {:unexpected_turn_completion_status, status}}
+    end
+  end
+
+  defp turn_completion_reason(turn) do
+    error = Map.get(turn, "error")
+
+    %{
+      status: Map.get(turn, "status"),
+      message: if(is_map(error), do: Map.get(error, "message")),
+      codex_error_info: if(is_map(error), do: Map.get(error, "codexErrorInfo"))
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
   end
 
   defp emit_turn_event(on_message, event, payload, payload_string, port, payload_details) do

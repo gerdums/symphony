@@ -636,6 +636,16 @@ defmodule SymphonyElixir.Linear.AgentBridge do
     end)
   end
 
+  defp plan_for_update(%{event: event})
+       when event in [:startup_failed, :turn_failed, :turn_ended_with_error] do
+    [
+      %{
+        "content" => "Recovering the worker after a transient failure",
+        "status" => "inProgress"
+      }
+    ]
+  end
+
   defp plan_for_update(_update), do: nil
 
   defp create_activity(state, agent_session_id, content, opts \\ []) do
