@@ -2376,6 +2376,8 @@ the workflow.
   worker slots are full, Symphony SHOULD reuse that session and publish a durable waiting
   plan/activity. Polling MUST NOT create native sessions for every unadmitted queued issue. The issue
   MUST remain undelegated until a worker slot is actually admitted.
+- After a coordinator restart, the bridge SHOULD reconnect open sessions for eligible issues in the
+  configured project and close orphaned open sessions for issues that are no longer eligible.
 - Admission SHOULD update the same session to workspace preparation. When assignment-on-start is
   enabled, delegation to the app user MUST succeed before setup or coding work begins.
 - Recoverable worker exits SHOULD update the existing plan to a recovery state without emitting a

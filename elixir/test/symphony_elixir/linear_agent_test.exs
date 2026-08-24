@@ -242,6 +242,73 @@ defmodule SymphonyElixir.LinearAgentTest do
              AgentClient.find_open_session("issue-1", "app-user", request_fun: request_fun)
   end
 
+  test "agent client paginates open sessions for the configured app and project" do
+    test_pid = self()
+
+    request_fun = fn payload, _headers ->
+      send(test_pid, {:session_page, payload["variables"]["after"]})
+
+      nodes =
+        case payload["variables"]["after"] do
+          nil ->
+            [
+              %{
+                "id" => "session-page-1",
+                "status" => "active",
+                "appUser" => %{"id" => "app-user"},
+                "issue" => %{"id" => "issue-1", "project" => %{"slugId" => "project"}}
+              },
+              %{
+                "id" => "other-project",
+                "status" => "active",
+                "appUser" => %{"id" => "app-user"},
+                "issue" => %{"id" => "issue-other", "project" => %{"slugId" => "other"}}
+              }
+            ]
+
+          "next-page" ->
+            [
+              %{
+                "id" => "session-page-2",
+                "status" => "active",
+                "appUser" => %{"id" => "app-user"},
+                "issue" => %{"id" => "issue-2", "project" => %{"slugId" => "project"}}
+              },
+              %{
+                "id" => "completed-session",
+                "status" => "complete",
+                "appUser" => %{"id" => "app-user"},
+                "issue" => %{"id" => "issue-complete", "project" => %{"slugId" => "project"}}
+              }
+            ]
+        end
+
+      page_info =
+        if is_nil(payload["variables"]["after"]) do
+          %{"hasNextPage" => true, "endCursor" => "next-page"}
+        else
+          %{"hasNextPage" => false, "endCursor" => nil}
+        end
+
+      {:ok,
+       %{
+         status: 200,
+         body: %{
+           "data" => %{
+             "agentSessions" => %{"nodes" => nodes, "pageInfo" => page_info}
+           }
+         }
+       }}
+    end
+
+    assert {:ok, sessions} =
+             AgentClient.list_open_sessions("app-user", "project", request_fun: request_fun)
+
+    assert Enum.map(sessions, & &1["id"]) == ["session-page-1", "session-page-2"]
+    assert_received {:session_page, nil}
+    assert_received {:session_page, "next-page"}
+  end
+
   test "agent client prepares a private upload and puts the exact bytes" do
     test_pid = self()
     bytes = <<1, 2, 3, 4>>
@@ -875,6 +942,94 @@ defmodule SymphonyElixir.LinearAgentTest do
 
     assert waiting_text =~ "Waiting for an available worker slot"
     assert AgentBridge.session_for_issue(issue.id, bridge_name) == "session-reconnected"
+  end
+
+  test "bridge closes orphaned open sessions and reconnects eligible sessions after restart" do
+    test_pid = self()
+
+    request_fun = fn payload, _headers ->
+      cond do
+        payload["query"] =~ "SymphonyListAgentSessions" ->
+          send(test_pid, :open_session_reconciliation)
+
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "data" => %{
+                 "agentSessions" => %{
+                   "nodes" => [
+                     %{
+                       "id" => "session-eligible",
+                       "status" => "active",
+                       "appUser" => %{"id" => "app-user"},
+                       "issue" => %{
+                         "id" => "issue-eligible",
+                         "project" => %{"slugId" => "project"}
+                       }
+                     },
+                     %{
+                       "id" => "session-orphaned",
+                       "status" => "active",
+                       "appUser" => %{"id" => "app-user"},
+                       "issue" => %{
+                         "id" => "issue-orphaned",
+                         "project" => %{"slugId" => "project"}
+                       }
+                     }
+                   ],
+                   "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+                 }
+               }
+             }
+           }}
+
+        payload["query"] =~ "SymphonyCreateAgentActivity" ->
+          send(test_pid, {:activity, payload["variables"]["input"]})
+
+          {:ok,
+           %{
+             status: 200,
+             body: %{
+               "data" => %{
+                 "agentActivityCreate" => %{
+                   "success" => true,
+                   "agentActivity" => %{"id" => "activity-orphaned"}
+                 }
+               }
+             }
+           }}
+
+        true ->
+          flunk("unexpected GraphQL operation")
+      end
+    end
+
+    bridge_name = String.to_atom("linear_agent_reconcile_bridge_#{System.unique_integer([:positive])}")
+
+    start_supervised!({AgentBridge, name: bridge_name, orchestrator: nil, client_opts: [request_fun: request_fun]})
+
+    assert :ok =
+             AgentBridge.reconcile_open_sessions(
+               [%Issue{id: "issue-eligible"}],
+               bridge_name
+             )
+
+    assert_receive :open_session_reconciliation, 1_000
+
+    assert_receive {:activity,
+                    %{
+                      "agentSessionId" => "session-orphaned",
+                      "content" => %{"type" => "response", "body" => close_message},
+                      "ephemeral" => false
+                    }},
+                   1_000
+
+    assert close_message =~ "No worker is currently running"
+    assert AgentBridge.session_for_issue("issue-eligible", bridge_name) == "session-eligible"
+
+    assert :ok = AgentBridge.reconcile_open_sessions([], bridge_name)
+    refute_receive :open_session_reconciliation, 100
   end
 
   test "bridge marks recoverable worker failures in the plan without an error activity" do

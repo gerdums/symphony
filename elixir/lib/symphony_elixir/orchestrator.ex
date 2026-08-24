@@ -598,6 +598,12 @@ defmodule SymphonyElixir.Orchestrator do
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
         state = record_session_completion_totals(state, running_entry)
 
+        _ =
+          AgentBridge.close(
+            issue_id,
+            "Symphony stopped this run because the issue is no longer eligible for this workflow. No worker is currently running."
+          )
+
         stop_running_task(pid, ref, state.task_supervisor)
 
         if cleanup_workspace do
@@ -820,6 +826,11 @@ defmodule SymphonyElixir.Orchestrator do
   defp choose_issues(issues, state) do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
+
+    eligible_issues =
+      Enum.filter(issues, &candidate_issue?(&1, active_states, terminal_states))
+
+    :ok = AgentBridge.reconcile_open_sessions(eligible_issues)
 
     issues
     |> sort_issues_for_dispatch()

@@ -226,7 +226,9 @@ Eligible tickets that already have a native session but cannot start because eve
 worker is full keep that session and show a durable waiting plan/activity in Linear. Normal polling
 does not create agent sessions for every unadmitted ticket. When a slot opens, an existing session
 moves to workspace preparation and then streams the coding agent's progress; it does not create a
-machine-specific replacement session.
+machine-specific replacement session. After a coordinator restart, Symphony reconnects open
+sessions for eligible issues in the configured project and closes orphaned sessions whose issues
+are no longer eligible, so Linear does not leave them displaying `Working...` without a worker.
 
 Create a Linear OAuth application with the `read`, `write`, `app:assignable`, and
 `app:mentionable` scopes, enable Agent Session events, and point its webhook at

@@ -28,6 +28,25 @@ defmodule SymphonyElixir.Linear.AgentClient do
     }
   }
   """
+  @list_sessions_query """
+  query SymphonyListAgentSessions($first: Int!, $after: String) {
+    agentSessions(first: $first, after: $after) {
+      nodes {
+        id
+        status
+        appUser { id }
+        issue {
+          id
+          project { slugId }
+        }
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+  """
   @create_activity_mutation """
   mutation SymphonyCreateAgentActivity($input: AgentActivityCreateInput!) {
     agentActivityCreate(input: $input) {
@@ -61,6 +80,8 @@ defmodule SymphonyElixir.Linear.AgentClient do
   }
   """
 
+  @session_page_size 50
+
   @spec create_session(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def create_session(issue_id, opts \\ []) when is_binary(issue_id) do
     input = %{"issueId" => issue_id}
@@ -87,6 +108,13 @@ defmodule SymphonyElixir.Linear.AgentClient do
       {:error, _reason} = error -> error
       other -> {:error, {:linear_agent_unknown_payload, other}}
     end
+  end
+
+  @spec list_open_sessions(String.t(), String.t(), keyword()) ::
+          {:ok, [map()]} | {:error, term()}
+  def list_open_sessions(app_user_id, project_slug, opts \\ [])
+      when is_binary(app_user_id) and is_binary(project_slug) do
+    list_open_sessions_page(app_user_id, project_slug, nil, [], opts)
   end
 
   @spec create_activity(String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
@@ -221,6 +249,34 @@ defmodule SymphonyElixir.Linear.AgentClient do
     case get_in(body, ["data" | path]) do
       %{} = value -> {:ok, value}
       _ -> {:error, {:linear_agent_unknown_payload, path}}
+    end
+  end
+
+  defp list_open_sessions_page(app_user_id, project_slug, after_cursor, acc, opts) do
+    variables = %{"first" => @session_page_size, "after" => after_cursor}
+
+    with {:ok, body} <- graphql(@list_sessions_query, variables, opts),
+         %{"nodes" => nodes, "pageInfo" => page_info} when is_list(nodes) <-
+           get_in(body, ["data", "agentSessions"]) do
+      matching_sessions =
+        Enum.filter(nodes, fn session ->
+          open_session_for_app?(session, app_user_id) and
+            get_in(session, ["issue", "project", "slugId"]) == project_slug and
+            is_binary(get_in(session, ["issue", "id"]))
+        end)
+
+      updated_acc = acc ++ matching_sessions
+
+      case page_info do
+        %{"hasNextPage" => true, "endCursor" => end_cursor} when is_binary(end_cursor) ->
+          list_open_sessions_page(app_user_id, project_slug, end_cursor, updated_acc, opts)
+
+        _ ->
+          {:ok, updated_acc}
+      end
+    else
+      {:error, _reason} = error -> error
+      other -> {:error, {:linear_agent_unknown_payload, other}}
     end
   end
 

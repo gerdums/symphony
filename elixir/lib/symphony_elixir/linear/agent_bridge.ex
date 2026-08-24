@@ -24,6 +24,7 @@ defmodule SymphonyElixir.Linear.AgentBridge do
             waiting_issues: MapSet.new(),
             waiting_session_requests: MapSet.new(),
             checked_existing_waiting_sessions: MapSet.new(),
+            open_session_reconciliation: :pending,
             work_started_issues: MapSet.new(),
             failure_notified_issues: MapSet.new(),
             seen_webhooks: MapSet.new()
@@ -59,6 +60,21 @@ defmodule SymphonyElixir.Linear.AgentBridge do
   @spec waiting_for_existing_slot(Issue.t(), GenServer.server()) :: :ok
   def waiting_for_existing_slot(%Issue{} = issue, server \\ __MODULE__) do
     GenServer.cast(server, {:waiting_for_existing_slot, issue})
+  end
+
+  @doc """
+  Reconnects this workflow's open native sessions after a coordinator restart
+  and closes sessions whose issues are no longer eligible.
+  """
+  @spec reconcile_open_sessions([Issue.t()], GenServer.server()) :: :ok
+  def reconcile_open_sessions(issues, server \\ __MODULE__) when is_list(issues) do
+    issue_ids =
+      Enum.flat_map(issues, fn
+        %Issue{id: issue_id} when is_binary(issue_id) -> [issue_id]
+        _ -> []
+      end)
+
+    GenServer.cast(server, {:reconcile_open_sessions, MapSet.new(issue_ids)})
   end
 
   @spec start_work(Issue.t(), GenServer.server()) :: :ok | {:error, term()} | :disabled
@@ -110,6 +126,12 @@ defmodule SymphonyElixir.Linear.AgentBridge do
   def complete(issue_id, summary, server \\ __MODULE__)
       when is_binary(issue_id) and is_binary(summary) do
     GenServer.call(server, {:complete, issue_id, summary}, 35_000)
+  end
+
+  @spec close(String.t(), String.t(), GenServer.server()) :: :ok
+  def close(issue_id, summary, server \\ __MODULE__)
+      when is_binary(issue_id) and is_binary(summary) do
+    GenServer.cast(server, {:close, issue_id, summary})
   end
 
   @spec fail(String.t(), String.t(), GenServer.server()) :: :ok
@@ -265,6 +287,20 @@ defmodule SymphonyElixir.Linear.AgentBridge do
   end
 
   @impl true
+  def handle_cast({:close, issue_id, summary}, state) do
+    case session_id(state, issue_id) do
+      nil ->
+        {:noreply, state}
+
+      agent_session_id ->
+        run_async(fn ->
+          create_activity(state, agent_session_id, %{"type" => "response", "body" => summary})
+        end)
+
+        {:noreply, delete_session(state, issue_id, agent_session_id)}
+    end
+  end
+
   def handle_cast({:accept_webhook, payload}, state) do
     {:noreply, handle_webhook(payload, state)}
   end
@@ -312,6 +348,35 @@ defmodule SymphonyElixir.Linear.AgentBridge do
 
       true ->
         {:noreply, request_existing_waiting_session(state, issue_id, settings.app_user_id)}
+    end
+  end
+
+  def handle_cast({:reconcile_open_sessions, eligible_issue_ids}, state) do
+    settings = Config.settings!()
+
+    cond do
+      !settings.linear_agent.enabled ->
+        {:noreply, state}
+
+      state.open_session_reconciliation != :pending ->
+        {:noreply, state}
+
+      true ->
+        bridge = self()
+
+        {:ok, _pid} =
+          Task.start(fn ->
+            result =
+              state.client.list_open_sessions(
+                settings.linear_agent.app_user_id,
+                settings.tracker.project_slug,
+                client_opts(state)
+              )
+
+            send(bridge, {:open_session_reconciliation_result, eligible_issue_ids, result})
+          end)
+
+        {:noreply, %{state | open_session_reconciliation: :running}}
     end
   end
 
@@ -412,6 +477,36 @@ defmodule SymphonyElixir.Linear.AgentBridge do
 
         {:noreply, mark_existing_waiting_session_checked(state, issue_id)}
     end
+  end
+
+  def handle_info({:open_session_reconciliation_result, eligible_issue_ids, {:ok, sessions}}, state)
+      when is_list(sessions) do
+    state =
+      Enum.reduce(sessions, state, fn
+        %{"id" => session_id, "issue" => %{"id" => issue_id}}, state_acc
+        when is_binary(session_id) and is_binary(issue_id) ->
+          if MapSet.member?(eligible_issue_ids, issue_id) do
+            put_session(state_acc, issue_id, session_id)
+          else
+            publish_ineligible_session_close_async(state_acc, session_id)
+            state_acc
+          end
+
+        _session, state_acc ->
+          state_acc
+      end)
+
+    {:noreply, %{state | open_session_reconciliation: :complete}}
+  end
+
+  def handle_info({:open_session_reconciliation_result, _eligible_issue_ids, {:error, reason}}, state) do
+    Logger.warning("Unable to reconcile open Linear agent sessions after restart: #{inspect(reason)}")
+    {:noreply, %{state | open_session_reconciliation: :complete}}
+  end
+
+  def handle_info({:open_session_reconciliation_result, _eligible_issue_ids, other}, state) do
+    Logger.warning("Invalid open Linear agent session reconciliation response: #{inspect(other)}")
+    {:noreply, %{state | open_session_reconciliation: :complete}}
   end
 
   defp publish_codex_update(state, agent_session_id, update) do
@@ -951,6 +1046,15 @@ defmodule SymphonyElixir.Linear.AgentBridge do
     end)
   end
 
+  defp publish_ineligible_session_close_async(state, agent_session_id) do
+    run_async(fn ->
+      create_activity(state, agent_session_id, %{
+        "type" => "response",
+        "body" => "Symphony stopped this run because the issue is no longer eligible for this workflow. No worker is currently running."
+      })
+    end)
+  end
+
   defp request_waiting_session(state, issue_id, app_user_id) do
     bridge = self()
 
@@ -1040,6 +1144,16 @@ defmodule SymphonyElixir.Linear.AgentBridge do
       | sessions_by_issue: Map.put(state.sessions_by_issue, issue_id, session_id),
         issue_by_session: Map.put(state.issue_by_session, session_id, issue_id),
         checked_existing_waiting_sessions: MapSet.delete(state.checked_existing_waiting_sessions, issue_id)
+    }
+  end
+
+  defp delete_session(state, issue_id, session_id) do
+    %{
+      state
+      | sessions_by_issue: Map.delete(state.sessions_by_issue, issue_id),
+        issue_by_session: Map.delete(state.issue_by_session, session_id),
+        waiting_issues: MapSet.delete(state.waiting_issues, issue_id),
+        work_started_issues: MapSet.delete(state.work_started_issues, issue_id)
     }
   end
 
