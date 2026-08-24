@@ -2258,14 +2258,18 @@ Extension config:
 
 - `worker.ssh_hosts` (list of SSH host strings, OPTIONAL)
   - When omitted, work runs locally.
+- `worker.include_local` (boolean, OPTIONAL, default `false`)
+  - When `ssh_hosts` is non-empty and this is `true`, the coordinator joins the worker pool.
+  - Local execution wins equal-load ties so a coordinator can remain the preferred host.
 - `worker.max_concurrent_agents_per_host` (positive integer, OPTIONAL)
-  - Shared per-host cap applied across configured SSH hosts.
+  - Shared per-host cap applied across local and configured SSH hosts.
 
 ### A.1 Execution Model
 
 - The orchestrator remains the single source of truth for polling, claims, retries, and
   reconciliation.
-- `worker.ssh_hosts` provides the candidate SSH destinations for remote execution.
+- `worker.ssh_hosts` provides the candidate SSH destinations for remote execution. With
+  `worker.include_local: true`, the coordinator is an additional candidate.
 - Each worker run is assigned to one host at a time, and that host becomes part of the run's
   effective execution identity along with the issue workspace.
 - `workspace.root` is interpreted on the remote host, not on the orchestrator host.
@@ -2283,8 +2287,8 @@ Extension config:
   available.
 - `worker.max_concurrent_agents_per_host` is an OPTIONAL shared per-host cap across configured SSH
   hosts.
-- When all SSH hosts are at capacity, dispatch SHOULD wait rather than silently falling back to a
-  different execution mode.
+- When all configured worker hosts are at capacity, dispatch SHOULD wait rather than silently
+  falling back to an execution mode that was not configured.
 - Implementations MAY fail over to another host when the original host is unavailable before work
   has meaningfully started.
 - Once a run has already produced side effects, a transparent rerun on another host SHOULD be
@@ -2310,3 +2314,64 @@ Extension config:
 - Cleanup and observability:
   - Operators need to know which host owns a run, where its workspace lives, and whether cleanup
     happened on the right machine.
+
+## Appendix B. Native Linear Agent Session Extension (OPTIONAL)
+
+This extension lets a Linear OAuth application own a native Agent Session while Symphony remains
+the execution coordinator.
+
+Extension config:
+
+- `linear_agent.enabled` (boolean, default `false`)
+  - `SYMPHONY_LINEAR_AGENT_ENABLED` MAY override this in host-private deployment configuration.
+- `linear_agent.display_name` (string or `$VAR`, default `Symphony Agent`)
+- `linear_agent.endpoint` (URL, default `https://api.linear.app/graphql`)
+- `linear_agent.token_endpoint` (URL, default `https://api.linear.app/oauth/token`)
+- `linear_agent.access_token` (secret string or `$VAR`, OPTIONAL short-lived authentication)
+- `linear_agent.client_secret` (secret string or `$VAR`, OPTIONAL client-credentials authentication)
+- One of `linear_agent.access_token` or `linear_agent.client_secret` is REQUIRED when enabled.
+- `linear_agent.webhook_secret` (secret string or `$VAR`, REQUIRED when enabled)
+- `linear_agent.oauth_client_id` (string or `$VAR`, REQUIRED when enabled)
+- `linear_agent.app_user_id` (string or `$VAR`, REQUIRED when enabled)
+- `linear_agent.scopes` (non-empty list, default `read`, `write`, `app:assignable`, and
+  `app:mentionable`)
+- `linear_agent.webhook_max_age_ms` (positive integer, default `60000`)
+- `linear_agent.proof.required` (boolean, default `true`)
+- `linear_agent.proof.minimum_screenshots` (non-negative integer, default `1`)
+- `linear_agent.proof.max_file_bytes` (positive integer, default `10485760`)
+
+Host-private deployments MAY provide `SYMPHONY_WORKER_SSH_HOSTS` as a comma-separated override and
+`SYMPHONY_WORKER_INCLUDE_LOCAL` as a boolean override so topology does not need to be committed with
+the workflow.
+
+### B.1 Session and Prompt Lifecycle
+
+- A Linear Agent Session is the durable user-facing conversation and MUST NOT depend on which
+  worker host executes the run.
+- The webhook endpoint MUST verify `Linear-Signature` against the raw body using HMAC-SHA256 and
+  SHOULD reject stale `webhookTimestamp` values.
+- A `created` event SHOULD register the supplied session and queue its `promptContext`.
+- A `prompted` event SHOULD queue the new prompt activity. When a Codex turn is active, the prompt
+  SHOULD be sent through the targeted app-server's steering method. Otherwise it SHOULD wake or
+  resume orchestration for that issue.
+- Symphony SHOULD reuse a non-complete session owned by the configured app user after a process
+  restart instead of creating a duplicate session.
+- When client-credentials authentication is configured, Symphony SHOULD cache the short-lived
+  app-actor token in coordinator memory, renew it before expiry, and retry once after an
+  authentication failure.
+- Meaningful execution events MAY be translated into native `thought`, `action`, `elicitation`,
+  `response`, or `error` activities. Raw command output and secrets MUST NOT be copied blindly.
+
+### B.2 Screenshot Proof
+
+- When proof is required, the coding agent SHOULD receive a host-side tool for uploading proof to
+  the current native session.
+- Proof paths MUST resolve to regular image files inside the current issue workspace, including for
+  SSH workers, and MUST respect the configured byte limit.
+- Uploads SHOULD use Linear's private file-upload flow and embed the returned asset URL in Markdown
+  activity content.
+- A session completion response MUST be withheld when the configured minimum proof count has not
+  been met.
+- OAuth credentials, webhook secrets, client IDs, app-user IDs, public ingress details, private
+  labels, and worker host names MUST stay out of public repository configuration and the coding-agent
+  child environment.

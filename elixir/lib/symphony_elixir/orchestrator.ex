@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.Linear.AgentBridge
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -173,6 +174,7 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, state}
 
       running_entry ->
+        :ok = AgentBridge.report_codex_update(issue_id, update)
         {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
 
         state =
@@ -206,20 +208,25 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_agent_down(:normal, state, issue_id, running_entry, session_id) do
-    if input_required_blocker?(running_entry) do
-      block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
-    else
-      Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+    cond do
+      input_required_blocker?(running_entry) ->
+        block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
 
-      state
-      |> complete_issue(issue_id)
-      |> schedule_issue_retry(issue_id, 1, %{
-        identifier: running_entry.identifier,
-        issue_url: running_entry.issue.url,
-        delay_type: :continuation,
-        worker_host: Map.get(running_entry, :worker_host),
-        workspace_path: Map.get(running_entry, :workspace_path)
-      })
+      Map.get(running_entry, :run_outcome) == :terminal ->
+        complete_terminal_agent_run(state, issue_id, running_entry, session_id)
+
+      true ->
+        Logger.info("Agent worker batch ended for issue_id=#{issue_id} session_id=#{session_id}; scheduling eligibility check")
+
+        state
+        |> complete_issue(issue_id)
+        |> schedule_issue_retry(issue_id, 1, %{
+          identifier: running_entry.identifier,
+          issue_url: running_entry.issue.url,
+          delay_type: :continuation,
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path)
+        })
     end
   end
 
@@ -228,6 +235,41 @@ defmodule SymphonyElixir.Orchestrator do
       block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
     else
       retry_agent_down(state, issue_id, running_entry, session_id, reason)
+    end
+  end
+
+  defp complete_terminal_agent_run(state, issue_id, running_entry, session_id) do
+    case AgentBridge.complete(
+           issue_id,
+           "The agent completed its run. Review the activity and screenshot proof above."
+         ) do
+      {:error, :proof_required} ->
+        Logger.warning("Agent completion blocked for issue_id=#{issue_id} session_id=#{session_id}: screenshot proof required")
+        block_issue_from_entry(state, issue_id, running_entry, "required screenshot proof was not uploaded")
+
+      {:error, reason} ->
+        Logger.warning("Unable to complete Linear agent session for issue_id=#{issue_id} session_id=#{session_id}: #{inspect(reason)}")
+
+        schedule_issue_retry(state, issue_id, 1, %{
+          identifier: running_entry.identifier,
+          issue_url: running_entry.issue.url,
+          error: "Linear agent session completion failed",
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path)
+        })
+
+      _ ->
+        Logger.info("Agent task completed for terminal issue_id=#{issue_id} session_id=#{session_id}")
+
+        state
+        |> complete_issue(issue_id)
+        |> schedule_issue_retry(issue_id, 1, %{
+          identifier: running_entry.identifier,
+          issue_url: running_entry.issue.url,
+          delay_type: :continuation,
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path)
+        })
     end
   end
 
@@ -240,6 +282,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_agent_down(state, issue_id, running_entry, session_id, reason) do
+    :ok = AgentBridge.fail(issue_id, "The worker stopped unexpectedly. Symphony will retry while preserving this session.")
     Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
 
     next_attempt = next_retry_attempt_from_running(running_entry)
@@ -978,6 +1021,7 @@ defmodule SymphonyElixir.Orchestrator do
             last_codex_message: nil,
             last_codex_timestamp: nil,
             last_codex_event: nil,
+            run_outcome: nil,
             codex_app_server_pid: nil,
             codex_input_tokens: 0,
             codex_output_tokens: 0,
@@ -1286,23 +1330,34 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp select_worker_host(%State{} = state, preferred_worker_host) do
-    case Config.settings!().worker.ssh_hosts do
-      [] ->
-        nil
+    available_hosts =
+      Config.settings!().worker
+      |> configured_worker_hosts()
+      |> Enum.filter(&worker_host_slots_available?(state, &1))
 
-      hosts ->
-        available_hosts = Enum.filter(hosts, &worker_host_slots_available?(state, &1))
+    cond do
+      available_hosts == [] ->
+        :no_worker_capacity
 
-        cond do
-          available_hosts == [] ->
-            :no_worker_capacity
+      preferred_worker_host_available?(preferred_worker_host, available_hosts) ->
+        preferred_worker_host
 
-          preferred_worker_host_available?(preferred_worker_host, available_hosts) ->
-            preferred_worker_host
+      true ->
+        least_loaded_worker_host(state, available_hosts)
+    end
+  end
 
-          true ->
-            least_loaded_worker_host(state, available_hosts)
-        end
+  defp configured_worker_hosts(%{ssh_hosts: ssh_hosts, include_local: include_local}) do
+    remote_hosts =
+      ssh_hosts
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.uniq()
+
+    cond do
+      remote_hosts == [] -> [nil]
+      include_local -> [nil | remote_hosts]
+      true -> remote_hosts
     end
   end
 
@@ -1322,7 +1377,7 @@ defmodule SymphonyElixir.Orchestrator do
     |> elem(0)
   end
 
-  defp running_worker_host_count(running, worker_host) when is_map(running) and is_binary(worker_host) do
+  defp running_worker_host_count(running, worker_host) when is_map(running) do
     Enum.count(running, fn
       {_issue_id, %{worker_host: ^worker_host}} -> true
       _ -> false
@@ -1337,7 +1392,7 @@ defmodule SymphonyElixir.Orchestrator do
     select_worker_host(state, preferred_worker_host) != :no_worker_capacity
   end
 
-  defp worker_host_slots_available?(%State{} = state, worker_host) when is_binary(worker_host) do
+  defp worker_host_slots_available?(%State{} = state, worker_host) do
     case Config.settings!().worker.max_concurrent_agents_per_host do
       limit when is_integer(limit) and limit > 0 ->
         running_worker_host_count(state.running, worker_host) < limit
@@ -1410,6 +1465,39 @@ defmodule SymphonyElixir.Orchestrator do
     else
       :unavailable
     end
+  end
+
+  @spec linear_agent_prompt_available(String.t(), GenServer.server()) :: :ok
+  def linear_agent_prompt_available(issue_id, server \\ __MODULE__) when is_binary(issue_id) do
+    GenServer.cast(server, {:linear_agent_prompt_available, issue_id})
+  end
+
+  @impl true
+  def handle_cast({:linear_agent_prompt_available, issue_id}, state) do
+    case Map.get(state.running, issue_id) do
+      %{pid: pid} when is_pid(pid) ->
+        send(pid, {:linear_agent_prompt_available, issue_id})
+        {:noreply, state}
+
+      _ ->
+        state = release_blocked_issue_for_prompt(state, issue_id)
+        {:noreply, schedule_tick(state, 0)}
+    end
+  end
+
+  defp release_blocked_issue_for_prompt(state, issue_id) do
+    case Map.get(state.retry_attempts, issue_id) do
+      %{timer_ref: timer_ref} when is_reference(timer_ref) -> Process.cancel_timer(timer_ref)
+      _ -> :ok
+    end
+
+    %{
+      state
+      | blocked: Map.delete(state.blocked, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        claimed: MapSet.delete(state.claimed, issue_id),
+        completed: MapSet.delete(state.completed, issue_id)
+    }
   end
 
   @impl true
@@ -1529,6 +1617,7 @@ defmodule SymphonyElixir.Orchestrator do
         last_codex_message: summarize_codex_update(update),
         session_id: session_id_for_update(running_entry.session_id, update),
         last_codex_event: event,
+        run_outcome: Map.get(update, :outcome, Map.get(running_entry, :run_outcome)),
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
         codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
