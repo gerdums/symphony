@@ -414,6 +414,55 @@ defmodule SymphonyElixir.ExtensionsTest do
              }
   end
 
+  test "Linear agent webhook verifies the exact raw JSON body before accepting" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      linear_agent_enabled: true,
+      linear_agent_access_token: "oauth-token",
+      linear_agent_webhook_secret: "webhook-secret",
+      linear_agent_oauth_client_id: "oauth-client",
+      linear_agent_app_user_id: "app-user"
+    )
+
+    start_test_endpoint([])
+    timestamp = System.system_time(:millisecond)
+
+    raw_body =
+      Jason.encode!(%{
+        "type" => "AgentSessionEvent",
+        "action" => "updated",
+        "webhookId" => "webhook-controller",
+        "webhookTimestamp" => timestamp,
+        "oauthClientId" => "oauth-client",
+        "appUserId" => "app-user",
+        "agentSession" => %{}
+      })
+
+    signature =
+      :crypto.mac(:hmac, :sha256, "webhook-secret", raw_body)
+      |> Base.encode16(case: :lower)
+
+    conn =
+      build_conn()
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+      |> Plug.Conn.put_req_header("linear-signature", signature)
+      |> post("/api/v1/linear/agent-events", raw_body)
+
+    assert json_response(conn, 200) == %{"accepted" => true}
+
+    rejected =
+      build_conn()
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+      |> Plug.Conn.put_req_header("linear-signature", signature)
+      |> post("/api/v1/linear/agent-events", raw_body <> " ")
+
+    assert json_response(rejected, 401) == %{
+             "error" => %{
+               "code" => "invalid_signature",
+               "message" => "Invalid webhook signature"
+             }
+           }
+  end
+
   test "phoenix observability api preserves snapshot timeout behavior" do
     timeout_orchestrator = Module.concat(__MODULE__, :TimeoutOrchestrator)
     {:ok, _pid} = SlowOrchestrator.start_link(name: timeout_orchestrator)

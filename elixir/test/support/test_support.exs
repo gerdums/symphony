@@ -104,7 +104,22 @@ defmodule SymphonyElixir.TestSupport do
           poll_interval_ms: 30_000,
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
           worker_ssh_hosts: [],
+          worker_include_local: false,
           worker_max_concurrent_agents_per_host: nil,
+          linear_agent_enabled: false,
+          linear_agent_display_name: "Symphony Agent",
+          linear_agent_endpoint: "https://api.linear.app/graphql",
+          linear_agent_token_endpoint: "https://api.linear.app/oauth/token",
+          linear_agent_access_token: nil,
+          linear_agent_client_secret: nil,
+          linear_agent_webhook_secret: nil,
+          linear_agent_oauth_client_id: nil,
+          linear_agent_app_user_id: nil,
+          linear_agent_scopes: ["read", "write", "app:assignable", "app:mentionable"],
+          linear_agent_webhook_max_age_ms: 60_000,
+          linear_agent_proof_required: true,
+          linear_agent_minimum_screenshots: 1,
+          linear_agent_max_file_bytes: 10_485_760,
           max_concurrent_agents: 10,
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
@@ -144,7 +159,22 @@ defmodule SymphonyElixir.TestSupport do
     poll_interval_ms = Keyword.get(config, :poll_interval_ms)
     workspace_root = Keyword.get(config, :workspace_root)
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
+    worker_include_local = Keyword.get(config, :worker_include_local)
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
+    linear_agent_enabled = Keyword.get(config, :linear_agent_enabled)
+    linear_agent_display_name = Keyword.get(config, :linear_agent_display_name)
+    linear_agent_endpoint = Keyword.get(config, :linear_agent_endpoint)
+    linear_agent_token_endpoint = Keyword.get(config, :linear_agent_token_endpoint)
+    linear_agent_access_token = Keyword.get(config, :linear_agent_access_token)
+    linear_agent_client_secret = Keyword.get(config, :linear_agent_client_secret)
+    linear_agent_webhook_secret = Keyword.get(config, :linear_agent_webhook_secret)
+    linear_agent_oauth_client_id = Keyword.get(config, :linear_agent_oauth_client_id)
+    linear_agent_app_user_id = Keyword.get(config, :linear_agent_app_user_id)
+    linear_agent_scopes = Keyword.get(config, :linear_agent_scopes)
+    linear_agent_webhook_max_age_ms = Keyword.get(config, :linear_agent_webhook_max_age_ms)
+    linear_agent_proof_required = Keyword.get(config, :linear_agent_proof_required)
+    linear_agent_minimum_screenshots = Keyword.get(config, :linear_agent_minimum_screenshots)
+    linear_agent_max_file_bytes = Keyword.get(config, :linear_agent_max_file_bytes)
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
@@ -186,7 +216,23 @@ defmodule SymphonyElixir.TestSupport do
         "  interval_ms: #{yaml_value(poll_interval_ms)}",
         "workspace:",
         "  root: #{yaml_value(workspace_root)}",
-        worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
+        worker_yaml(worker_ssh_hosts, worker_include_local, worker_max_concurrent_agents_per_host),
+        linear_agent_yaml(%{
+          enabled: linear_agent_enabled,
+          display_name: linear_agent_display_name,
+          endpoint: linear_agent_endpoint,
+          token_endpoint: linear_agent_token_endpoint,
+          access_token: linear_agent_access_token,
+          client_secret: linear_agent_client_secret,
+          webhook_secret: linear_agent_webhook_secret,
+          oauth_client_id: linear_agent_oauth_client_id,
+          app_user_id: linear_agent_app_user_id,
+          scopes: linear_agent_scopes,
+          webhook_max_age_ms: linear_agent_webhook_max_age_ms,
+          proof_required: linear_agent_proof_required,
+          minimum_screenshots: linear_agent_minimum_screenshots,
+          max_file_bytes: linear_agent_max_file_bytes
+        }),
         "agent:",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
         "  max_turns: #{yaml_value(max_turns)}",
@@ -248,18 +294,52 @@ defmodule SymphonyElixir.TestSupport do
     |> Enum.join("\n")
   end
 
-  defp worker_yaml(ssh_hosts, max_concurrent_agents_per_host)
-       when ssh_hosts in [nil, []] and is_nil(max_concurrent_agents_per_host),
+  defp worker_yaml(ssh_hosts, include_local, max_concurrent_agents_per_host)
+       when ssh_hosts in [nil, []] and include_local == false and is_nil(max_concurrent_agents_per_host),
        do: nil
 
-  defp worker_yaml(ssh_hosts, max_concurrent_agents_per_host) do
+  defp worker_yaml(ssh_hosts, include_local, max_concurrent_agents_per_host) do
     [
       "worker:",
       ssh_hosts not in [nil, []] && "  ssh_hosts: #{yaml_value(ssh_hosts)}",
+      include_local && "  include_local: #{yaml_value(include_local)}",
       !is_nil(max_concurrent_agents_per_host) &&
         "  max_concurrent_agents_per_host: #{yaml_value(max_concurrent_agents_per_host)}"
     ]
     |> Enum.reject(&(&1 in [nil, false]))
+    |> Enum.join("\n")
+  end
+
+  defp linear_agent_yaml(%{
+         enabled: false,
+         access_token: nil,
+         client_secret: nil,
+         webhook_secret: nil,
+         oauth_client_id: nil,
+         app_user_id: nil
+       }),
+       do: nil
+
+  defp linear_agent_yaml(config) do
+    [
+      "linear_agent:",
+      "  enabled: #{yaml_value(config.enabled)}",
+      "  display_name: #{yaml_value(config.display_name)}",
+      "  endpoint: #{yaml_value(config.endpoint)}",
+      "  token_endpoint: #{yaml_value(config.token_endpoint)}",
+      "  access_token: #{yaml_value(config.access_token)}",
+      "  client_secret: #{yaml_value(config.client_secret)}",
+      "  webhook_secret: #{yaml_value(config.webhook_secret)}",
+      "  oauth_client_id: #{yaml_value(config.oauth_client_id)}",
+      "  app_user_id: #{yaml_value(config.app_user_id)}",
+      "  scopes: #{yaml_value(config.scopes)}",
+      "  webhook_max_age_ms: #{yaml_value(config.webhook_max_age_ms)}",
+      "  proof:",
+      "    required: #{yaml_value(config.proof_required)}",
+      "    minimum_screenshots: #{yaml_value(config.minimum_screenshots)}",
+      "    max_file_bytes: #{yaml_value(config.max_file_bytes)}"
+    ]
+    |> Enum.reject(&String.ends_with?(&1, ": null"))
     |> Enum.join("\n")
   end
 

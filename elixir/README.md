@@ -205,6 +205,86 @@ codex:
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
 
+### Native Linear agent sessions
+
+Symphony can optionally appear as a native Linear agent instead of reporting through ordinary
+comments. The native session stays attached to the Linear issue while execution runs locally or on
+an SSH worker. Replies in that session are injected into the current Codex turn with `turn/steer`,
+and are queued for the next run when no turn is active.
+
+Create a Linear OAuth application with the `read`, `write`, `app:assignable`, and
+`app:mentionable` scopes, enable Agent Session events, and point its webhook at
+`https://<public-webhook-host>/api/v1/linear/agent-events`. The app display name and logo are owned
+by private Linear configuration rather than this repository. Configure the approved name and brand
+asset there; the public integration remains vendor-neutral.
+
+Keep the OAuth access token or client secret, signing secret, OAuth client ID, app-user ID, public
+webhook hostname, and machine routing in host-private configuration. A public or repo-owned
+workflow should contain only environment references:
+
+```yaml
+linear_agent:
+  enabled: true
+  display_name: $LINEAR_AGENT_DISPLAY_NAME
+  token_endpoint: https://api.linear.app/oauth/token
+  client_secret: $LINEAR_AGENT_CLIENT_SECRET
+  webhook_secret: $LINEAR_AGENT_WEBHOOK_SECRET
+  oauth_client_id: $LINEAR_AGENT_OAUTH_CLIENT_ID
+  app_user_id: $LINEAR_AGENT_APP_USER_ID
+  scopes: [read, write, "app:assignable", "app:mentionable"]
+  webhook_max_age_ms: 60000
+  proof:
+    required: true
+    minimum_screenshots: 1
+    max_file_bytes: 10485760
+server:
+  host: 127.0.0.1
+  port: 4000
+```
+
+The webhook receiver verifies Linear's HMAC-SHA256 signature against the exact raw request body and
+rejects stale deliveries. Expose only the webhook path through a TLS reverse proxy or tunnel; the
+dashboard and observability API have no public-authentication layer.
+
+For durable server-to-server operation, enable client-credentials tokens on the Linear OAuth app.
+Symphony exchanges the private client ID and secret for a 30-day app-actor token, caches it in
+memory, renews it before expiry, and retries once after a `401`. `access_token` remains available for
+short-lived development, but `client_secret` is preferred for unattended coordinators.
+
+When proof is enabled, Codex receives the `linear_agent_proof` dynamic tool. The tool accepts a
+workspace-contained PNG, JPEG, or WebP screenshot, requests a private Linear upload URL, uploads the
+bytes host-side, and embeds the image in the native agent activity stream. Symphony withholds the
+session's completion response when fewer than `minimum_screenshots` were uploaded. Agent OAuth
+credentials and webhook secrets are stripped from the Codex child environment.
+
+For a coordinator that can run locally and on one or more SSH workers, opt the local host into the
+same least-loaded pool:
+
+```yaml
+worker:
+  include_local: true
+  ssh_hosts:
+    - worker.example
+  max_concurrent_agents_per_host: 2
+```
+
+`include_local` defaults to `false` when SSH hosts are configured, preserving remote-only behavior.
+When it is `true`, local wins equal-load ties and remote capacity is used as the local host fills.
+Only the coordinator needs the public webhook and Linear OAuth credentials; SSH workers continue to
+communicate over Symphony's existing stdio transport.
+
+Host-private launchers may enable the same settings without modifying a repo-owned workflow:
+
+```bash
+export SYMPHONY_LINEAR_AGENT_ENABLED=true
+export SYMPHONY_WORKER_INCLUDE_LOCAL=true
+export SYMPHONY_WORKER_SSH_HOSTS=worker.example
+```
+
+`SYMPHONY_WORKER_SSH_HOSTS` is a comma-separated list. The two worker-routing environment variables
+are also stripped from the local Codex child environment so host topology does not leak through an
+inherited shell environment.
+
 ### Linear adapter profile
 
 - Config: use `tracker.kind: linear` with `tracker.provider.endpoint` (default

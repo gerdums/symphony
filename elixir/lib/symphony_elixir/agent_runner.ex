@@ -6,6 +6,7 @@ defmodule SymphonyElixir.AgentRunner do
   require Logger
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.Linear.AgentBridge
   alias SymphonyElixir.Tracker.Issue
 
   @type worker_host :: String.t() | nil
@@ -21,7 +22,12 @@ defmodule SymphonyElixir.AgentRunner do
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
     # The orchestrator owns host retries so one worker lifetime never hops machines.
-    worker_host = selected_worker_host(Keyword.get(opts, :worker_host), Config.settings!().worker.ssh_hosts)
+    worker_host =
+      if Keyword.has_key?(opts, :worker_host) do
+        Keyword.get(opts, :worker_host)
+      else
+        selected_worker_host(Config.settings!().worker.ssh_hosts)
+      end
 
     Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
@@ -38,20 +44,28 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
     Logger.info("Starting worker attempt for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
-    case Workspace.create_for_issue(issue, worker_host) do
-      {:ok, workspace} ->
-        send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
+    with {:ok, _session_id} <- ensure_linear_agent_session(issue),
+         {:ok, workspace} <- Workspace.create_for_issue(issue, worker_host) do
+      send_worker_runtime_info(codex_update_recipient, issue, worker_host, workspace)
 
-        try do
-          with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-            run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
-          end
-        after
-          Workspace.run_after_run_hook(workspace, issue, worker_host)
+      try do
+        with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
+          run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
         end
-
+      after
+        Workspace.run_after_run_hook(workspace, issue, worker_host)
+      end
+    else
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp ensure_linear_agent_session(issue) do
+    case AgentBridge.ensure_session(issue) do
+      :disabled -> {:ok, nil}
+      {:ok, session_id} -> {:ok, session_id}
+      {:error, reason} -> {:error, {:linear_agent_session_failed, reason}}
     end
   end
 
@@ -99,7 +113,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+    prompt = build_turn_prompt(issue, opts, turn_number, max_turns) |> append_linear_agent_context(issue.id)
 
     with {:ok, turn_session} <-
            AppServer.run_turn(
@@ -128,9 +142,16 @@ defmodule SymphonyElixir.AgentRunner do
         {:continue, refreshed_issue} ->
           Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
 
+          send_run_outcome(codex_update_recipient, issue, :active)
           :ok
 
-        {:done, _refreshed_issue} ->
+        {:done, refreshed_issue} ->
+          send_run_outcome(
+            codex_update_recipient,
+            issue,
+            run_outcome_for_issue(refreshed_issue)
+          )
+
           :ok
 
         {:error, reason} ->
@@ -151,6 +172,38 @@ defmodule SymphonyElixir.AgentRunner do
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
     """
+  end
+
+  defp append_linear_agent_context(prompt, issue_id) do
+    sections =
+      [
+        prompt,
+        AgentBridge.prompt_guidance(),
+        pending_linear_prompt(issue_id)
+      ]
+      |> Enum.reject(&is_nil/1)
+
+    Enum.join(sections, "\n\n")
+  end
+
+  defp pending_linear_prompt(issue_id) do
+    if Config.settings!().linear_agent.enabled and is_binary(issue_id) do
+      take_pending_linear_prompt(issue_id)
+    end
+  end
+
+  defp take_pending_linear_prompt(issue_id) do
+    case AgentBridge.take_prompt(issue_id) do
+      {:ok, %{body: body}} ->
+        """
+        Linear agent session instruction:
+
+        #{body}
+        """
+
+      :empty ->
+        nil
+    end
   end
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
@@ -181,6 +234,29 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp active_issue_state?(_state_name), do: false
 
+  defp run_outcome_for_issue(%Issue{state: state_name}) when is_binary(state_name) do
+    normalized_state = normalize_issue_state(state_name)
+
+    terminal? =
+      Config.settings!().tracker.terminal_states
+      |> Enum.any?(fn terminal_state -> normalize_issue_state(terminal_state) == normalized_state end)
+
+    if terminal?, do: :terminal, else: :inactive
+  end
+
+  defp run_outcome_for_issue(_issue), do: :inactive
+
+  defp send_run_outcome(recipient, %Issue{} = issue, outcome)
+       when is_pid(recipient) and outcome in [:active, :inactive, :terminal] do
+    send_codex_update(recipient, issue, %{
+      event: :run_finished,
+      outcome: outcome,
+      timestamp: DateTime.utc_now()
+    })
+  end
+
+  defp send_run_outcome(_recipient, _issue, _outcome), do: :ok
+
   defp issue_routable?(%Issue{} = issue) do
     tracker = Config.settings!().tracker
 
@@ -192,20 +268,14 @@ defmodule SymphonyElixir.AgentRunner do
     )
   end
 
-  defp selected_worker_host(nil, []), do: nil
+  defp selected_worker_host([]), do: nil
 
-  defp selected_worker_host(preferred_host, configured_hosts) when is_list(configured_hosts) do
-    hosts =
-      configured_hosts
-      |> Enum.map(&String.trim/1)
-      |> Enum.reject(&(&1 == ""))
-      |> Enum.uniq()
-
-    case preferred_host do
-      host when is_binary(host) and host != "" -> host
-      _ when hosts == [] -> nil
-      _ -> List.first(hosts)
-    end
+  defp selected_worker_host(configured_hosts) when is_list(configured_hosts) do
+    configured_hosts
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+    |> List.first()
   end
 
   defp worker_host_for_log(nil), do: "local"

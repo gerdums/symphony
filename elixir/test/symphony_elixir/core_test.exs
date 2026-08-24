@@ -1273,6 +1273,24 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
+  test "include_local adds the coordinator as the first two-host worker" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      worker_ssh_hosts: ["remote-worker"],
+      worker_include_local: true,
+      worker_max_concurrent_agents_per_host: 1
+    )
+
+    assert Orchestrator.select_worker_host_for_test(%Orchestrator.State{running: %{}}, nil) == nil
+
+    state = %Orchestrator.State{
+      running: %{
+        "issue-local" => %{worker_host: nil}
+      }
+    }
+
+    assert Orchestrator.select_worker_host_for_test(state, nil) == "remote-worker"
+  end
+
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
 
@@ -2378,5 +2396,31 @@ defmodule SymphonyElixir.CoreTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "a Linear follow-up prompt immediately releases a blocked issue for dispatch" do
+    issue_id = "linear-prompted-issue"
+    retry_timer_ref = Process.send_after(self(), :stale_linear_retry, 60_000)
+
+    state = %Orchestrator.State{
+      blocked: %{issue_id => %{error: "operator input required"}},
+      claimed: MapSet.new([issue_id]),
+      completed: MapSet.new([issue_id]),
+      retry_attempts: %{
+        issue_id => %{attempt: 2, timer_ref: retry_timer_ref}
+      }
+    }
+
+    assert {:noreply, updated_state} =
+             Orchestrator.handle_cast({:linear_agent_prompt_available, issue_id}, state)
+
+    refute Map.has_key?(updated_state.blocked, issue_id)
+    refute Map.has_key?(updated_state.retry_attempts, issue_id)
+    refute MapSet.member?(updated_state.claimed, issue_id)
+    refute MapSet.member?(updated_state.completed, issue_id)
+    assert is_reference(updated_state.tick_timer_ref)
+    assert_receive {:tick, tick_token}
+    assert tick_token == updated_state.tick_token
+    refute_receive :stale_linear_retry
   end
 end

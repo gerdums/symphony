@@ -116,12 +116,43 @@ defmodule SymphonyElixir.Config do
   @doc false
   @spec validate_settings(Schema.t()) :: :ok | {:error, term()}
   def validate_settings(settings) do
+    with :ok <- validate_tracker_settings(settings) do
+      validate_linear_agent_settings(settings.linear_agent)
+    end
+  end
+
+  defp validate_tracker_settings(settings) do
     if is_nil(settings.tracker.kind) do
       {:error, :missing_tracker_kind}
     else
       Tracker.validate_config(settings.tracker)
     end
   end
+
+  defp validate_linear_agent_settings(%{enabled: false}), do: :ok
+
+  defp validate_linear_agent_settings(linear_agent) do
+    required = [
+      webhook_secret: linear_agent.webhook_secret,
+      oauth_client_id: linear_agent.oauth_client_id,
+      app_user_id: linear_agent.app_user_id
+    ]
+
+    case Enum.find(required, fn {_name, value} -> !is_binary(value) or String.trim(value) == "" end) do
+      nil -> validate_linear_agent_authentication(linear_agent)
+      {name, _value} -> {:error, {:missing_linear_agent_setting, name}}
+    end
+  end
+
+  defp validate_linear_agent_authentication(linear_agent) do
+    if present?(linear_agent.access_token) or present?(linear_agent.client_secret) do
+      :ok
+    else
+      {:error, {:missing_linear_agent_setting, :access_token_or_client_secret}}
+    end
+  end
+
+  defp present?(value), do: is_binary(value) and String.trim(value) != ""
 
   defp format_config_error(reason) do
     case reason do
