@@ -735,7 +735,7 @@ defmodule SymphonyElixir.LinearAgentTest do
                      "item" => %{
                        "id" => "message-1",
                        "type" => "agentMessage",
-                       "text" => "I updated the implementation and am validating it now."
+                       "text" => "I updated the implementation and am validating it now. https://github.com/example/app/pull/42"
                      }
                    }
                  }
@@ -746,8 +746,58 @@ defmodule SymphonyElixir.LinearAgentTest do
     assert_receive {:activity,
                     %{
                       "content" => %{
+                        "type" => "response",
+                        "body" => "I updated the implementation and am validating it now. https://github.com/example/app/pull/42"
+                      },
+                      "ephemeral" => false
+                    }},
+                   1_000
+
+    assert_receive {:activity,
+                    %{
+                      "content" => %{
                         "type" => "thought",
-                        "body" => "I updated the implementation and am validating it now."
+                        "body" => "Codex is continuing this run."
+                      },
+                      "ephemeral" => true
+                    }},
+                   1_000
+
+    assert_receive {:session_update,
+                    %{
+                      "id" => "session-stream",
+                      "input" => %{
+                        "addedExternalUrls" => [
+                          %{
+                            "label" => "Pull request",
+                            "url" => "https://github.com/example/app/pull/42"
+                          }
+                        ]
+                      }
+                    }},
+                   1_000
+
+    assert :ok =
+             AgentBridge.report_codex_update(
+               "issue-stream",
+               %{
+                 event: :notification,
+                 payload: %{
+                   "method" => "turn/diff/updated",
+                   "params" => %{
+                     "diff" => "diff --git a/lib/example.ex b/lib/example.ex\n--- a/lib/example.ex\n+++ b/lib/example.ex\n-old\n+new\n+another\n"
+                   }
+                 }
+               },
+               bridge_name
+             )
+
+    assert_receive {:activity,
+                    %{
+                      "content" => %{
+                        "type" => "action",
+                        "action" => "Code changes updated",
+                        "parameter" => "Changed files: 1; +2 -1 lines"
                       },
                       "ephemeral" => false
                     }},

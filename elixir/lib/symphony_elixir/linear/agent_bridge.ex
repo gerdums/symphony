@@ -505,6 +505,8 @@ defmodule SymphonyElixir.Linear.AgentBridge do
   end
 
   defp publish_codex_update(state, agent_session_id, update) do
+    publish_external_urls(state, agent_session_id, update)
+
     case plan_for_update(update) do
       plan when is_list(plan) ->
         _ = state.client.update_session(agent_session_id, %{"plan" => plan}, client_opts(state))
@@ -570,6 +572,17 @@ defmodule SymphonyElixir.Linear.AgentBridge do
 
   defp publish_codex_activity(state, agent_session_id, update) do
     case activity_for_update(update) do
+      %{"type" => "response"} = content ->
+        _ = create_activity(state, agent_session_id, content)
+
+        _ =
+          create_activity(
+            state,
+            agent_session_id,
+            %{"type" => "thought", "body" => "Codex is continuing this run."},
+            ephemeral: true
+          )
+
       %{} = content ->
         _ = create_activity(state, agent_session_id, content, ephemeral: ephemeral_update?(update))
 
@@ -729,6 +742,14 @@ defmodule SymphonyElixir.Linear.AgentBridge do
     activity_for_completed_item(item)
   end
 
+  defp activity_for_notification(%{
+         "method" => "turn/diff/updated",
+         "params" => %{"diff" => diff}
+       })
+       when is_binary(diff) do
+    diff_activity(diff)
+  end
+
   defp activity_for_notification(_payload), do: nil
 
   defp activity_for_started_item(%{"type" => "commandExecution"}),
@@ -757,11 +778,12 @@ defmodule SymphonyElixir.Linear.AgentBridge do
 
   defp activity_for_started_item(_item), do: nil
 
-  # An app-server agentMessage can be emitted before the worker turn has actually
-  # ended. Linear treats a response activity as the terminal answer for the
-  # current agent turn, so progress messages must remain non-terminal.
+  # Linear only renders response activities as foreground conversation messages;
+  # thoughts are folded into the Working disclosure. Publish each completed
+  # app-server message as a response, then immediately reactivate the same
+  # session with an ephemeral thought because the worker turn may still continue.
   defp activity_for_completed_item(%{"type" => "agentMessage", "text" => text}),
-    do: thought_activity(text)
+    do: response_activity(text)
 
   defp activity_for_completed_item(%{"type" => "reasoning"} = item),
     do: thought_activity(reasoning_summary(item))
@@ -807,6 +829,59 @@ defmodule SymphonyElixir.Linear.AgentBridge do
   end
 
   defp thought_activity(_text), do: nil
+
+  defp response_activity(text) when is_binary(text) do
+    case safe_activity_text(text, 4_000) do
+      "" -> nil
+      body -> %{"type" => "response", "body" => body}
+    end
+  end
+
+  defp response_activity(_text), do: nil
+
+  defp diff_activity(diff) do
+    file_count = Regex.scan(~r/^diff --git /m, diff) |> length()
+    additions = Regex.scan(~r/^\+(?!\+\+)/m, diff) |> length()
+    deletions = Regex.scan(~r/^-(?!--)/m, diff) |> length()
+
+    action_activity(
+      "Code changes updated",
+      "Changed files: #{file_count}; +#{additions} -#{deletions} lines"
+    )
+  end
+
+  defp publish_external_urls(state, agent_session_id, update) do
+    case pull_request_urls_for_update(update) do
+      [] ->
+        :ok
+
+      urls ->
+        added_external_urls =
+          Enum.map(urls, fn url -> %{"label" => "Pull request", "url" => url} end)
+
+        _ =
+          state.client.update_session(
+            agent_session_id,
+            %{"addedExternalUrls" => added_external_urls},
+            client_opts(state)
+          )
+
+        :ok
+    end
+  end
+
+  defp pull_request_urls_for_update(update) do
+    case notification_payload(update) do
+      %{"method" => "item/completed", "params" => %{"item" => item}} when is_map(item) ->
+        ~r{https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+}
+        |> Regex.scan(Jason.encode!(item), capture: :first)
+        |> List.flatten()
+        |> Enum.uniq()
+
+      _ ->
+        []
+    end
+  end
 
   defp reasoning_summary(%{"summary" => summary}) when is_list(summary) do
     summary
