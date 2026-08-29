@@ -1371,6 +1371,7 @@ defmodule SymphonyElixir.Orchestrator do
     available_hosts =
       Config.settings!().worker
       |> configured_worker_hosts()
+      |> Enum.filter(&SymphonyElixir.WorkerAdmission.active?/1)
       |> Enum.filter(&worker_host_slots_available?(state, &1))
 
     cond do
