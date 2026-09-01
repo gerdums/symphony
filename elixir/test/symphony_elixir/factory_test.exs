@@ -154,6 +154,8 @@ defmodule SymphonyElixir.FactoryTest do
       phase="$SYMPHONY_FACTORY_PHASE"
       test "$2" = "$3" || exit 17
       project_count=0
+      issue_count=0
+      title_count=0
       run_count=0
       scope_count=0
       while [ "$#" -gt 0 ]; do
@@ -163,6 +165,16 @@ defmodule SymphonyElixir.FactoryTest do
           --project)
             test "$1" = project || exit 18
             project_count=$((project_count + 1))
+            shift
+            ;;
+          --issue)
+            test "$1" = APP-1 || exit 25
+            issue_count=$((issue_count + 1))
+            shift
+            ;;
+          --issue-title)
+            test "$1" = "Build autonomous factory" || exit 26
+            title_count=$((title_count + 1))
             shift
             ;;
           --run-id)
@@ -178,6 +190,8 @@ defmodule SymphonyElixir.FactoryTest do
         esac
       done
       test "$project_count" -eq 1 || exit 21
+      test "$issue_count" -eq 1 || exit 27
+      test "$title_count" -eq 1 || exit 28
       test "$run_count" -eq 1 || exit 22
       if [ "$phase" = planning ]; then
         test "$scope_count" -eq 0 || exit 23
@@ -235,6 +249,10 @@ defmodule SymphonyElixir.FactoryTest do
           "untrusted-one",
           "--project",
           "untrusted-two",
+          "--issue",
+          "WRONG-1",
+          "--issue-title",
+          "Wrong title",
           "--run-id",
           "untrusted-run",
           "--work-scope",
@@ -243,7 +261,7 @@ defmodule SymphonyElixir.FactoryTest do
         phase_timeout_ms: 5_000
     }
 
-    issue = %Issue{id: "issue-1", identifier: "APP-1"}
+    issue = %Issue{id: "issue-1", identifier: "APP-1", title: "Build autonomous factory"}
 
     assert :ok =
              Runner.run(issue, workspace,

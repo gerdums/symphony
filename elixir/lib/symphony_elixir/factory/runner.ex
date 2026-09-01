@@ -1690,6 +1690,7 @@ defmodule SymphonyElixir.Factory.Runner do
       "{{ factory.project_key }}" => project_key || "",
       "{{ issue.id }}" => issue.id || "",
       "{{ issue.identifier }}" => issue.identifier || "",
+      "{{ issue.title }}" => issue_title(issue),
       "{{ workspace }}" => workspace,
       "{{ phase }}" => phase,
       "{{ review_feedback }}" => feedback_json(feedback)
@@ -1703,6 +1704,8 @@ defmodule SymphonyElixir.Factory.Runner do
       end)
 
     rendered = put_authoritative_option(rendered, "--project", project_key)
+    rendered = put_authoritative_option(rendered, "--issue", issue.identifier)
+    rendered = put_authoritative_option(rendered, "--issue-title", issue_title(issue))
     rendered = put_authoritative_option(rendered, "--run-id", journal["run_id"])
 
     case {phase, journal["work_scope"]} do
@@ -1715,6 +1718,8 @@ defmodule SymphonyElixir.Factory.Runner do
   defp put_authoritative_option(args, option, value) when is_binary(value) do
     drop_option(args, option) ++ [option, value]
   end
+
+  defp issue_title(issue), do: issue.title || issue.identifier || ""
 
   defp drop_option([option, _value | rest], option), do: drop_option(rest, option)
   defp drop_option([option], option), do: []
