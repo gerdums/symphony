@@ -3,7 +3,8 @@ defmodule SymphonyElixir.Linear.AgentTool do
   Provider-native Linear tool exposed to Codex app-server turns.
   """
 
-  alias SymphonyElixir.Linear.Client
+  alias SymphonyElixir.Config
+  alias SymphonyElixir.Linear.{AgentClient, Client}
 
   @linear_graphql_tool "linear_graphql"
   @linear_graphql_description """
@@ -54,8 +55,7 @@ defmodule SymphonyElixir.Linear.AgentTool do
   end
 
   defp execute_linear_graphql(arguments, opts) do
-    linear_client = Keyword.get(opts, :linear_client, &Client.graphql/3)
-    client_opts = Keyword.take(opts, [:tracker_settings])
+    {linear_client, client_opts} = linear_client(opts)
 
     with {:ok, query, variables} <- normalize_linear_graphql_arguments(arguments),
          {:ok, response} <- linear_client.(query, variables, client_opts) do
@@ -63,6 +63,33 @@ defmodule SymphonyElixir.Linear.AgentTool do
     else
       {:error, reason} ->
         failure_response(tool_error_payload(reason))
+    end
+  end
+
+  defp linear_client(opts) do
+    case Keyword.fetch(opts, :linear_client) do
+      {:ok, client} ->
+        {client, Keyword.take(opts, [:tracker_settings])}
+
+      :error ->
+        linear_agent_settings =
+          Keyword.get_lazy(opts, :linear_agent_settings, fn ->
+            Config.settings!().linear_agent
+          end)
+
+        if linear_agent_settings.enabled do
+          client = Keyword.get(opts, :linear_agent_client, &AgentClient.graphql/3)
+
+          client_opts =
+            [agent_settings: linear_agent_settings] ++
+              Keyword.take(opts, [:credential_store, :request_fun])
+
+          {client, client_opts}
+        else
+          client = Keyword.get(opts, :tracker_linear_client, &Client.graphql/3)
+          client_opts = Keyword.take(opts, [:tracker_settings, :request_fun])
+          {client, client_opts}
+        end
     end
   end
 
@@ -191,6 +218,33 @@ defmodule SymphonyElixir.Linear.AgentTool do
       "error" => %{
         "message" => "Linear GraphQL request failed before receiving a successful response.",
         "reason" => inspect(reason)
+      }
+    }
+  end
+
+  defp tool_error_payload({:missing_linear_agent_setting, setting}) do
+    %{
+      "error" => %{
+        "message" => "Symphony's Linear app credential is missing #{setting}.",
+        "setting" => to_string(setting)
+      }
+    }
+  end
+
+  defp tool_error_payload({:linear_agent_api_status, status}) do
+    %{
+      "error" => %{
+        "message" => "Linear app GraphQL request failed with HTTP #{status}.",
+        "status" => status
+      }
+    }
+  end
+
+  defp tool_error_payload({:linear_agent_graphql_errors, errors}) do
+    %{
+      "error" => %{
+        "message" => "Linear rejected the app GraphQL request.",
+        "errors" => errors
       }
     }
   end

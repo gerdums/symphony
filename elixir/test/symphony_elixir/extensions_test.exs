@@ -21,6 +21,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     end
   end
 
+  defmodule FailingWebhookBridge do
+    def accept_webhook(_payload), do: {:error, :disk_full}
+  end
+
   defmodule SlowOrchestrator do
     use GenServer
 
@@ -61,12 +65,19 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   setup do
     linear_client_module = Application.get_env(:symphony_elixir, :linear_client_module)
+    webhook_bridge = Application.get_env(:symphony_elixir, :linear_agent_webhook_bridge)
 
     on_exit(fn ->
       if is_nil(linear_client_module) do
         Application.delete_env(:symphony_elixir, :linear_client_module)
       else
         Application.put_env(:symphony_elixir, :linear_client_module, linear_client_module)
+      end
+
+      if is_nil(webhook_bridge) do
+        Application.delete_env(:symphony_elixir, :linear_agent_webhook_bridge)
+      else
+        Application.put_env(:symphony_elixir, :linear_agent_webhook_bridge, webhook_bridge)
       end
     end)
 
@@ -498,6 +509,62 @@ defmodule SymphonyElixir.ExtensionsTest do
            }
   end
 
+  test "Linear webhook returns 503 when durable recording fails" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      linear_agent_enabled: true,
+      linear_agent_access_token: "oauth-token",
+      linear_agent_webhook_secret: "webhook-secret",
+      linear_agent_oauth_client_id: "oauth-client",
+      linear_agent_app_user_id: "app-user"
+    )
+
+    Application.put_env(:symphony_elixir, :linear_agent_webhook_bridge, FailingWebhookBridge)
+    start_test_endpoint([])
+    {raw_body, signature} = signed_agent_webhook("webhook-persistence-failure")
+
+    response =
+      build_conn()
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+      |> Plug.Conn.put_req_header("linear-signature", signature)
+      |> post("/api/v1/linear/agent-events", raw_body)
+
+    assert json_response(response, 503) == %{
+             "error" => %{
+               "code" => "webhook_recording_unavailable",
+               "message" => "Webhook could not be recorded"
+             }
+           }
+  end
+
+  test "Linear webhook returns 503 when the bridge process does not exist" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      linear_agent_enabled: true,
+      linear_agent_access_token: "oauth-token",
+      linear_agent_webhook_secret: "webhook-secret",
+      linear_agent_oauth_client_id: "oauth-client",
+      linear_agent_app_user_id: "app-user"
+    )
+
+    missing_bridge = String.to_atom("missing_webhook_bridge_#{System.unique_integer([:positive])}")
+
+    Application.put_env(
+      :symphony_elixir,
+      :linear_agent_webhook_bridge,
+      {SymphonyElixir.Linear.AgentBridge, missing_bridge}
+    )
+
+    start_test_endpoint([])
+    {raw_body, signature} = signed_agent_webhook("webhook-missing-bridge")
+
+    response =
+      build_conn()
+      |> Plug.Conn.put_req_header("content-type", "application/json")
+      |> Plug.Conn.put_req_header("linear-signature", signature)
+      |> post("/api/v1/linear/agent-events", raw_body)
+
+    assert json_response(response, 503)["error"]["code"] == "webhook_recording_unavailable"
+  end
+
   test "phoenix observability api preserves snapshot timeout behavior" do
     timeout_orchestrator = Module.concat(__MODULE__, :TimeoutOrchestrator)
     {:ok, _pid} = SlowOrchestrator.start_link(name: timeout_orchestrator)
@@ -734,6 +801,27 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     Application.put_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, endpoint_config)
     start_supervised!({SymphonyElixirWeb.Endpoint, []})
+  end
+
+  defp signed_agent_webhook(webhook_id) do
+    timestamp = System.system_time(:millisecond)
+
+    raw_body =
+      Jason.encode!(%{
+        "type" => "AgentSessionEvent",
+        "action" => "updated",
+        "webhookId" => webhook_id,
+        "webhookTimestamp" => timestamp,
+        "oauthClientId" => "oauth-client",
+        "appUserId" => "app-user",
+        "agentSession" => %{}
+      })
+
+    signature =
+      :crypto.mac(:hmac, :sha256, "webhook-secret", raw_body)
+      |> Base.encode16(case: :lower)
+
+    {raw_body, signature}
   end
 
   defp static_snapshot do

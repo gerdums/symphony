@@ -380,6 +380,70 @@ defmodule SymphonyElixir.LinearAgentTest do
     assert query =~ "includeArchived: true"
   end
 
+  test "agent client adds a pull request through AgentSession addedExternalUrls" do
+    test_pid = self()
+    pr_url = "https://github.com/example/app/pull/194"
+
+    request_fun = fn payload, _headers ->
+      cond do
+        payload["query"] =~ "SymphonyAgentSessionExternalLinks" ->
+          send(test_pid, {:external_links_query, payload["variables"]})
+
+          graphql_data(%{
+            "agentSession" => %{"id" => "session-1", "externalLinks" => []}
+          })
+
+        payload["query"] =~ "SymphonyUpdateAgentSession" ->
+          send(test_pid, {:external_links_update, payload["variables"]})
+
+          graphql_data(%{
+            "agentSessionUpdate" => %{
+              "success" => true,
+              "agentSession" => %{"id" => "session-1"}
+            }
+          })
+      end
+    end
+
+    assert {:ok, %{"id" => "session-1"}} =
+             AgentClient.ensure_external_url("session-1", "Pull Request", pr_url, request_fun: request_fun)
+
+    assert_received {:external_links_query, %{"id" => "session-1"}}
+
+    assert_received {:external_links_update,
+                     %{
+                       "id" => "session-1",
+                       "input" => %{
+                         "addedExternalUrls" => [
+                           %{"label" => "Pull Request", "url" => ^pr_url}
+                         ]
+                       }
+                     }}
+  end
+
+  test "agent client does not add an external URL already present on the session" do
+    test_pid = self()
+    pr_url = "https://github.com/example/app/pull/194"
+
+    request_fun = fn payload, _headers ->
+      send(test_pid, {:external_link_request, payload["query"]})
+
+      graphql_data(%{
+        "agentSession" => %{
+          "id" => "session-1",
+          "externalLinks" => [%{"label" => "Pull Request", "url" => pr_url}]
+        }
+      })
+    end
+
+    assert {:ok, %{"id" => "session-1"}} =
+             AgentClient.ensure_external_url("session-1", "Pull Request", pr_url, request_fun: request_fun)
+
+    assert_receive {:external_link_request, query}
+    assert query =~ "SymphonyAgentSessionExternalLinks"
+    refute_receive {:external_link_request, _query}
+  end
+
   test "agent client prepares a private upload and puts the exact bytes" do
     test_pid = self()
     bytes = <<1, 2, 3, 4>>
@@ -420,6 +484,51 @@ defmodule SymphonyElixir.LinearAgentTest do
     assert variables == %{"contentType" => "image/png", "filename" => "proof.png", "size" => 4}
 
     assert_received {:upload_put, "https://uploads.example.test/signed", [{"content-type", "image/png"}], ^bytes}
+  end
+
+  test "agent client adds the signed content type when Linear omits it from upload headers" do
+    test_pid = self()
+    bytes = <<1, 2, 3, 4>>
+
+    request_fun = fn _payload, _headers ->
+      {:ok,
+       %{
+         status: 200,
+         body: %{
+           "data" => %{
+             "fileUpload" => %{
+               "success" => true,
+               "uploadFile" => %{
+                 "uploadUrl" => "https://uploads.example.test/signed",
+                 "assetUrl" => "https://uploads.linear.app/private-proof",
+                 "headers" => [
+                   %{"key" => "x-goog-content-length-range", "value" => "0,10485760"},
+                   %{"key" => "Content-Disposition", "value" => "inline"}
+                 ]
+               }
+             }
+           }
+         }
+       }}
+    end
+
+    upload_request_fun = fn _url, headers, _body ->
+      send(test_pid, {:upload_headers, headers})
+      {:ok, %{status: 200}}
+    end
+
+    assert {:ok, "https://uploads.linear.app/private-proof"} =
+             AgentClient.upload_file("proof.png", "image/png", bytes,
+               request_fun: request_fun,
+               upload_request_fun: upload_request_fun
+             )
+
+    assert_received {:upload_headers,
+                     [
+                       {"x-goog-content-length-range", "0,10485760"},
+                       {"Content-Disposition", "inline"},
+                       {"Content-Type", "image/png"}
+                     ]}
   end
 
   test "webhook verifier checks the raw body HMAC and freshness" do
@@ -558,8 +667,8 @@ defmodule SymphonyElixir.LinearAgentTest do
     assert_received {:activity,
                      %{
                        "content" => %{
-                         "type" => "action",
-                         "result" => "![The updated screen](https://uploads.linear.app/private-proof)"
+                         "type" => "thought",
+                         "body" => "Screenshot proof: The updated screen\n\n![The updated screen](https://uploads.linear.app/private-proof)"
                        }
                      }}
 
@@ -690,7 +799,7 @@ defmodule SymphonyElixir.LinearAgentTest do
                      "item" => %{
                        "id" => "message-1",
                        "type" => "agentMessage",
-                       "text" => "I updated the implementation and am validating it now."
+                       "text" => "I updated the implementation and am validating it now. https://github.com/example/app/pull/42"
                      }
                    }
                  }
@@ -701,8 +810,58 @@ defmodule SymphonyElixir.LinearAgentTest do
     assert_receive {:activity,
                     %{
                       "content" => %{
+                        "type" => "response",
+                        "body" => "I updated the implementation and am validating it now. https://github.com/example/app/pull/42"
+                      },
+                      "ephemeral" => false
+                    }},
+                   1_000
+
+    assert_receive {:activity,
+                    %{
+                      "content" => %{
                         "type" => "thought",
-                        "body" => "I updated the implementation and am validating it now."
+                        "body" => "Codex is continuing this run."
+                      },
+                      "ephemeral" => true
+                    }},
+                   1_000
+
+    assert_receive {:session_update,
+                    %{
+                      "id" => "session-stream",
+                      "input" => %{
+                        "addedExternalUrls" => [
+                          %{
+                            "label" => "Pull request",
+                            "url" => "https://github.com/example/app/pull/42"
+                          }
+                        ]
+                      }
+                    }},
+                   1_000
+
+    assert :ok =
+             AgentBridge.report_codex_update(
+               "issue-stream",
+               %{
+                 event: :notification,
+                 payload: %{
+                   "method" => "turn/diff/updated",
+                   "params" => %{
+                     "diff" => "diff --git a/lib/example.ex b/lib/example.ex\n--- a/lib/example.ex\n+++ b/lib/example.ex\n-old\n+new\n+another\n"
+                   }
+                 }
+               },
+               bridge_name
+             )
+
+    assert_receive {:activity,
+                    %{
+                      "content" => %{
+                        "type" => "action",
+                        "action" => "Code changes updated",
+                        "parameter" => "Changed files: 1; +2 -1 lines"
                       },
                       "ephemeral" => false
                     }},
@@ -1123,6 +1282,9 @@ defmodule SymphonyElixir.LinearAgentTest do
     assert_receive {:delegate_cleared, "issue-orphaned"}, 1_000
     assert AgentBridge.session_for_issue("issue-eligible", bridge_name) == "session-eligible"
 
+    assert {:ok, "session-eligible"} =
+             AgentBridge.ensure_session(%Issue{id: "issue-eligible"}, bridge_name)
+
     assert :ok = AgentBridge.reconcile_open_sessions([], bridge_name)
     refute_receive :open_session_reconciliation, 100
   end
@@ -1410,4 +1572,6 @@ defmodule SymphonyElixir.LinearAgentTest do
       25 -> Enum.reverse(acc)
     end
   end
+
+  defp graphql_data(data), do: {:ok, %{status: 200, body: %{"data" => data}}}
 end

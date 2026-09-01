@@ -318,6 +318,224 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Factory do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    defmodule GitHub do
+      @moduledoc false
+      use Ecto.Schema
+      import Ecto.Changeset
+
+      @primary_key false
+      embedded_schema do
+        field(:enabled, :boolean, default: false)
+        field(:repository, :string)
+        field(:base_branch, :string, default: "main")
+        field(:required_check, :string, default: "factory/quality-gate")
+        field(:check_timeout_ms, :integer, default: 1_800_000)
+        field(:check_poll_interval_ms, :integer, default: 10_000)
+      end
+
+      @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+      def changeset(schema, attrs) do
+        schema
+        |> cast(
+          attrs,
+          [
+            :enabled,
+            :repository,
+            :base_branch,
+            :required_check,
+            :check_timeout_ms,
+            :check_poll_interval_ms
+          ],
+          empty_values: []
+        )
+        |> validate_required([:base_branch, :required_check])
+        |> validate_format(:repository, ~r/\A[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\z/, message: "must be owner/repository")
+        |> validate_format(:base_branch, ~r/\A(?!production(?:\/|\z)|release(?:\/|\z)).+\z/i, message: "must not be a production or release branch")
+        |> validate_inclusion(:required_check, ["factory/quality-gate"])
+        |> validate_number(:check_timeout_ms, greater_than: 0)
+        |> validate_number(:check_poll_interval_ms, greater_than: 0)
+      end
+    end
+
+    defmodule CommandStage do
+      @moduledoc false
+      use Ecto.Schema
+      import Ecto.Changeset
+
+      @primary_key false
+      embedded_schema do
+        field(:enabled, :boolean, default: false)
+        field(:args, {:array, :string}, default: [])
+        field(:timeout_ms, :integer, default: 300_000)
+        field(:backlog_state, :string, default: "Backlog")
+        field(:todo_state, :string, default: "Todo")
+      end
+
+      @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+      def changeset(schema, attrs) do
+        schema
+        |> cast(attrs, [:enabled, :args, :timeout_ms, :backlog_state, :todo_state], empty_values: [])
+        |> validate_number(:timeout_ms, greater_than: 0)
+        |> validate_change(:args, fn :args, args ->
+          if Enum.all?(args, &(is_binary(&1) and &1 != "")), do: [], else: [args: "must contain nonblank strings"]
+        end)
+      end
+    end
+
+    @primary_key false
+    embedded_schema do
+      field(:enabled, :boolean, default: false)
+      field(:project_key, :string)
+      field(:command, :string, default: "factory")
+
+      field(:args, {:array, :string},
+        default: [
+          "run",
+          "--project",
+          "{{ tracker.project_slug }}",
+          "--issue",
+          "{{ issue.identifier }}",
+          "--repository-path",
+          "{{ workspace }}",
+          "--phase",
+          "{{ phase }}"
+        ]
+      )
+
+      field(:phases, {:array, :string}, default: ["planning", "build", "review", "qa"])
+      field(:protocol_version, :integer, default: 1)
+      field(:phase_timeout_ms, :integer, default: 3_600_000)
+      field(:state_root, :string)
+      field(:proof_url_hosts, {:array, :string}, default: ["uploads.linear.app"])
+      field(:review_state, :string, default: "In Review")
+      field(:feedback_state, :string, default: "In Progress")
+      field(:review_from_states, {:array, :string}, default: ["In Progress"])
+      embeds_one(:github, GitHub, on_replace: :update, defaults_to_struct: true)
+      embeds_one(:grooming, CommandStage, on_replace: :update, defaults_to_struct: true)
+      embeds_one(:post_merge, CommandStage, on_replace: :update, defaults_to_struct: true)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [
+          :enabled,
+          :project_key,
+          :command,
+          :args,
+          :phases,
+          :protocol_version,
+          :phase_timeout_ms,
+          :state_root,
+          :proof_url_hosts,
+          :review_state,
+          :feedback_state,
+          :review_from_states
+        ],
+        empty_values: []
+      )
+      |> validate_required([
+        :command,
+        :args,
+        :phases,
+        :proof_url_hosts,
+        :review_state,
+        :feedback_state,
+        :review_from_states
+      ])
+      |> validate_length(:args, min: 1)
+      |> validate_inclusion(:phases, [["planning", "build", "review", "qa"]], message: "must be planning, build, review, and qa in that order")
+      |> validate_number(:protocol_version, equal_to: 1)
+      |> validate_number(:phase_timeout_ms, greater_than: 0)
+      |> validate_length(:proof_url_hosts, min: 1)
+      |> validate_length(:review_from_states, min: 1)
+      |> validate_change(:proof_url_hosts, &validate_host_allowlist/2)
+      |> validate_change(:review_state, &validate_not_done/2)
+      |> validate_change(:feedback_state, &validate_not_done/2)
+      |> validate_change(:review_from_states, &validate_state_allowlist/2)
+      |> cast_embed(:github, with: &GitHub.changeset/2)
+      |> cast_embed(:grooming, with: &CommandStage.changeset/2)
+      |> cast_embed(:post_merge, with: &CommandStage.changeset/2)
+      |> validate_github_requires_factory()
+      |> validate_repository_binding()
+      |> validate_command_stages()
+      |> validate_project_key()
+    end
+
+    defp validate_github_requires_factory(changeset) do
+      github = get_field(changeset, :github)
+
+      if github.enabled and !get_field(changeset, :enabled) do
+        add_error(changeset, :github, "requires factory.enabled")
+      else
+        changeset
+      end
+    end
+
+    defp validate_repository_binding(changeset) do
+      github = get_field(changeset, :github)
+
+      if github.enabled do
+        case github do
+          %{repository: repository} when is_binary(repository) and repository != "" -> changeset
+          _github -> add_error(changeset, :github, "repository is required when factory.github.enabled")
+        end
+      else
+        changeset
+      end
+    end
+
+    defp validate_command_stages(changeset) do
+      Enum.reduce([:grooming, :post_merge], changeset, fn field, current ->
+        stage = get_field(current, field)
+
+        if stage.enabled and stage.args == [] do
+          add_error(current, field, "enabled command stage requires args")
+        else
+          current
+        end
+      end)
+    end
+
+    defp validate_project_key(changeset) do
+      if get_field(changeset, :enabled) do
+        case get_field(changeset, :project_key) do
+          value when is_binary(value) and value != "" -> changeset
+          _missing -> add_error(changeset, :project_key, "is required when factory.enabled")
+        end
+      else
+        changeset
+      end
+    end
+
+    defp validate_host_allowlist(:proof_url_hosts, hosts) do
+      if Enum.all?(hosts, &(is_binary(&1) and Regex.match?(~r/\A(?:[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?\z/, &1))) do
+        []
+      else
+        [proof_url_hosts: "must contain DNS host names only"]
+      end
+    end
+
+    defp validate_not_done(field, state) do
+      if String.downcase(String.trim(state)) == "done", do: [{field, "must not be Done"}], else: []
+    end
+
+    defp validate_state_allowlist(:review_from_states, states) do
+      if Enum.all?(states, &(is_binary(&1) and String.trim(&1) != "" and String.downcase(String.trim(&1)) != "done")) do
+        []
+      else
+        [review_from_states: "must contain nonblank, non-Done states"]
+      end
+    end
+  end
+
   defmodule Hooks do
     @moduledoc false
     use Ecto.Schema
@@ -388,6 +606,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:linear_agent, LinearAgent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:factory, Factory, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
@@ -483,9 +702,22 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:linear_agent, with: &LinearAgent.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
+    |> cast_embed(:factory, with: &Factory.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
+    |> validate_factory_requires_linear_agent()
+  end
+
+  defp validate_factory_requires_linear_agent(changeset) do
+    factory = get_field(changeset, :factory)
+    linear_agent = get_field(changeset, :linear_agent)
+
+    if factory.enabled and !linear_agent.enabled do
+      add_error(changeset, :factory, "factory.enabled requires linear_agent.enabled")
+    else
+      changeset
+    end
   end
 
   defp finalize_settings(settings) do
@@ -557,13 +789,23 @@ defmodule SymphonyElixir.Config.Schema do
 
     linear_agent = finalize_linear_agent(settings.linear_agent)
 
+    factory = %{
+      settings.factory
+      | command:
+          resolve_secret_setting(
+            settings.factory.command,
+            System.get_env("SYMPHONY_FACTORY_COMMAND")
+          )
+    }
+
     %{
       settings
       | tracker: tracker,
         workspace: workspace,
         worker: worker,
         codex: codex,
-        linear_agent: linear_agent
+        linear_agent: linear_agent,
+        factory: factory
     }
   end
 

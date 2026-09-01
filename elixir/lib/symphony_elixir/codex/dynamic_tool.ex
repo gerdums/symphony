@@ -11,7 +11,12 @@ defmodule SymphonyElixir.Codex.DynamicTool do
     if tool in binding.linear_agent_tool_names do
       ProofTool.execute(tool, arguments, binding.linear_agent_settings, opts)
     else
-      Tracker.execute_bound_agent_tool(binding, tool, arguments, opts)
+      Tracker.execute_bound_agent_tool(
+        binding,
+        tool,
+        arguments,
+        Keyword.put(opts, :linear_agent_settings, binding.linear_agent_settings)
+      )
     end
   end
 

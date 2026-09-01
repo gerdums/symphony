@@ -329,6 +329,208 @@ Waiting-session provisioning and progress/activity delivery run asynchronously f
 state loop. A slow Linear request therefore does not block admitted workers from starting or prevent
 an active worker from consuming a follow-up prompt.
 
+### External software factory
+
+Set `factory.enabled: true` to replace the single Codex turn loop with an external factory command.
+Symphony still owns ticket admission, the issue workspace, Linear Agent Sessions, and status policy.
+It starts the factory command directly on the coordinator and bypasses Symphony's SSH worker
+admission and capacity checks. The factory interface owns the only permitted offload decisions:
+explicit `production_build` or `cpu_heavy_background` work may use a worker, while normal Planning,
+Build, Review, and QA remain local to the coordinator.
+
+```yaml
+factory:
+  enabled: true
+  project_key: example-mobile
+  command: factory
+  args:
+    - run
+    - --project
+    - "{{ factory.project_key }}"
+    - --issue
+    - "{{ issue.identifier }}"
+    - --repository-path
+    - "{{ workspace }}"
+    - --phase
+    - "{{ phase }}"
+  phases: [planning, build, review, qa]
+  protocol_version: 1
+  phase_timeout_ms: 3600000
+  state_root: .symphony-state/factory
+  proof_url_hosts: [uploads.linear.app]
+  review_state: In Review
+  feedback_state: In Progress
+  review_from_states: [In Progress]
+  github:
+    enabled: true
+    repository: example/mobile
+    base_branch: main
+    required_check: factory/quality-gate
+    check_timeout_ms: 1800000
+    check_poll_interval_ms: 10000
+  grooming:
+    enabled: true
+    args: [groom, --dry-run, --project, "{{ factory.project_key }}", --input, "{{ input }}"]
+    timeout_ms: 300000
+    backlog_state: Backlog
+    todo_state: Todo
+  post_merge:
+    enabled: true
+    args: [post-merge-internal-build, --project, "{{ factory.project_key }}", --issue, "{{ issue.identifier }}", --commit, "{{ commit_sha }}", --pr-number, "{{ pr_number }}", --run-id, "{{ run_id }}"]
+    timeout_ms: 7200000
+```
+
+Symphony runs Planning, Build, Review, and QA in that order. Each phase gets its own native Linear
+Agent Session. Activities include the emitting role so parallel agents remain distinguishable
+inside a phase. Enabling the factory requires `linear_agent.enabled: true`; the native sessions are
+part of the durable lifecycle, not an optional display adapter. `factory.project_key` is the
+factory protocol identity and is intentionally separate from Linear's project slug. Symphony
+removes configured copies of `--project` and `--run-id` and appends the journal-bound values to
+every phase invocation. After Planning emits `workScope`, Symphony likewise appends the trusted
+`--work-scope` value to Build, Review, and QA; those phases recover `proofTargets` through the same
+durable run ID. `factory.command` accepts a
+host-private `$ENVIRONMENT_VARIABLE` reference. `review_state` and `feedback_state` cannot be
+`Done`. A passed QA phase may move an
+issue to `In Review` only after QA completion, a merged `pr.updated` event, and an exact
+`factory/quality-gate` check with status `passed`. A reply posted to any phase session while the
+issue is `In Review` moves it back to `In Progress`; queued prompts are drained atomically and
+provided to every phase in that next run as `SYMPHONY_FACTORY_REVIEW_FEEDBACK_JSON` and the
+`{{ review_feedback }}` argument placeholder. `In Review` is polled for session visibility but is
+not dispatchable, even if accidentally listed in `tracker.active_states`. Symphony never moves an
+issue to `Done` and refuses to replace a canceled, closed, duplicate, or other human-terminal state.
+
+Backlog grooming is agent-led but deterministically applied. The dry-run response must set
+`agentLed: true`, bind the configured `project_key`, return exactly one decision per input issue,
+and supply a nonblank `summary` plus nonempty `acceptanceCriteria` before promoting an issue to
+`Todo`. Symphony accepts only `Backlog` or `Todo` targets, publishes the enrichment in the native
+Planning Agent Session, and remains the only component that performs the state transition.
+
+GitHub finalization is disabled by default. When `factory.github.enabled` is true, Symphony starts
+it only after all four phases emit `phase.completed`. The coordinator then:
+
+1. Refuses to continue if the issue workspace has tracked or untracked changes.
+2. Verifies `origin` matches the configured `github.repository`, then pushes `HEAD` without force
+   to `factory/<lowercase issue identifier>`.
+3. Reuses an open pull request only when its head branch, base branch, and head commit match. If none
+   exists, it creates one with the host `gh` executable.
+4. Polls the exact `factory/quality-gate` check. A missing, failed, or timed-out gate stops the run.
+5. Runs a squash merge pinned to the checked head commit, verifies GitHub reports the PR as merged,
+   conditionally dispatches and waits for the typed post-merge internal build selected by Planning,
+   links its exact GitHub Actions run in Linear, and publishes the final `pr.updated` event through
+   the QA Linear Agent Session.
+
+Symphony calls `git` and `gh` with direct argument lists. It does not invoke a shell. Every `gh`
+command is pinned with `--repo`, and returned pull-request URLs must be HTTPS URLs for that exact
+repository before Symphony checks or merges them. The configured base branch cannot be
+`production`, `release`, or a branch beneath either name. This finalizer does not create production
+releases, deploy, or move Linear issues to `Done`.
+
+The factory must commit every product file needed by `factory/quality-gate` before QA completes.
+That includes a repository-specific proof manifest when the product's check requires one. Symphony
+does not invent, stage, or amend proof content during finalization. A missing or uncommitted manifest
+leaves the workspace dirty or fails the required check, and either result stops the merge.
+
+The `{{ workspace }}` argument is Symphony's isolated per-issue checkout, not the project's static
+mirror. The factory writes one JSON object per stdout line. Stdout must contain JSONL only because
+Symphony treats malformed lines as a failed phase. Human-readable summaries may go to stderr;
+Symphony does not merge stderr into the protocol stream. Each event has these required fields:
+
+```json
+{
+  "protocolVersion": 1,
+  "eventId": "8f0cfe5b-b117-46b5-b7d7-4230d76b5932",
+  "runId": "cd720221-0970-4d69-91ef-a7a29e3c389b",
+  "occurredAt": "2026-08-31T20:00:00Z",
+  "project": "app",
+  "issue": "APP-123",
+  "type": "artifact.created",
+  "phase": "qa",
+  "payload": {
+    "artifact": {
+      "id": "f4dfe190-7d04-4567-9a57-b826d71b9355",
+      "kind": "video",
+      "storage": "local_file",
+      "uri": "/absolute/issue/workspace/proof.mp4",
+      "mimeType": "video/mp4",
+      "byteSize": 1048576,
+      "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "capturedAt": "2026-08-31T19:59:00Z",
+      "commitSha": "0123456789abcdef0123456789abcdef01234567",
+      "runId": "cd720221-0970-4d69-91ef-a7a29e3c389b",
+      "attempt": 1,
+      "bundleOrPackageId": "com.example.mobile",
+      "deviceIdentity": "ios-simulator:factory-device",
+      "issue": "APP-123",
+      "flow": "playback-flow",
+      "platform": "ios",
+      "relation": "after",
+      "description": "Maestro playback flow",
+      "durationMs": 12000
+    }
+  }
+}
+```
+
+Supported event types are `phase.started`, `agent.started`, `plan.updated`, `progress`,
+`diff.updated`, `check.completed`, `artifact.created`, `pr.updated`, `phase.completed`,
+`phase.failed`, and `blocked`. Images render inline. Videos and other artifacts render as native
+activity links. For `local_file` artifacts, Symphony accepts only absolute paths that resolve inside
+the issue workspace. It verifies the file size, SHA-256 digest, MIME/dimensions, and that the image
+or video actually decodes before uploading the bytes through Linear's existing file upload API.
+Built-in limits reject oversized files, dimensions above 10,000 pixels, and videos over ten minutes.
+`remote_url` and `linear_attachment` artifact URIs must use HTTPS and a configured
+`proof_url_hosts` entry, and require a trusted receipt bound to the event run ID, issue, commit SHA,
+asset digest, and URL; HTTPS alone is not proof. Linear Agent Activity content supports
+inline image markdown and ordinary links here, but this integration does not have a separate native
+video content block. Pull requests become Agent Session external URLs. Symphony derives the visible
+role from `agent.started.payload.role` and remembers it for later events in that phase. Moving the
+issue to `In Review` requires three independent events: QA completed, the PR state is `merged`, and
+the PR quality check is exactly `factory/quality-gate` with status `passed`.
+
+Planning must publish `workScope` (`non-runtime`, `runtime-static`, or `runtime-interactive`),
+`postMergeInternalBuild`, and a unique `proofTargets` matrix. Non-runtime work requires exact-head
+review and QA checks but no synthetic media. Static runtime work requires an exact-head screenshot
+for every target. Interactive runtime work requires both an exact-head screenshot and playable
+video for every target. A target may additionally require both `before` and `after` image
+relations. Every trusted review/QA `check.completed` carries `commitSha`; a later head change
+invalidates earlier checks and proof.
+
+When `factory.grooming.enabled` is true, each poll also discovers the configured Backlog state,
+writes a private prepared-JSON snapshot, and runs the deterministic `groom --dry-run` command.
+Symphony rejects incomplete, duplicate, related-issue, or `Done` decisions before mutation. Valid
+decisions receive a visible Planning Agent Session and may promote testable tickets to `Todo` or
+apply configured noise/label routes. The normal worker then moves `Todo` to `In Progress` before
+creating a workspace or running a phase.
+
+Linear's public Agent API does not expose its internal workspace-diff mutation. Its supported
+integration contract for native Agent Session changes is a pull-request URL added with
+`agentSessionUpdate.addedExternalUrls`. Symphony therefore treats `diff.updated` as a commit-bound
+phase contribution rather than pretending that a thought or action activity is a native diff. A
+`pr.updated` event must name a full head SHA already reported by that issue's `diff.updated` or
+`phase.completed` events. Symphony then adds the HTTPS pull-request URL, labeled `Pull Request`, to
+the event's phase session and every phase session that reported code changes. It queries the
+session's current `externalLinks` first, so retrying the same event does not add duplicates.
+
+Linear's GitHub integration resolves those external URLs to pull requests and supplies the native
+Changes view. If that integration cannot resolve the repository or pull request, the URL remains
+visible on the Agent Session but the public Agent API offers no supported way for Symphony to write
+the internal diff directly. Treat an empty Changes view in that case as an integration failure, not
+as permission to publish a synthetic activity.
+
+Event IDs must remain stable within one phase attempt. Symphony stores a versioned journal beneath
+`factory.state_root`, which must resolve outside the agent-writable issue workspace. The default is
+`.symphony-state/factory` beneath the configured workspace root. Each journal binds the configured
+project, Linear issue ID and identifier, factory run ID, phase event order, event IDs, and a
+canonical SHA-256 digest for every accepted event. Symphony skips completed phases after a restart.
+It discards the incomplete attempt's event sequence before starting a new attempt, so the new
+process does not need to reproduce random event IDs from the crashed process. Conflicting IDs within
+an attempt, contradictory events, and post-terminal streams fail closed. Each phase must emit
+exactly one terminal event and it must be last. The journal also retains planning, commit, review,
+QA, merge, and post-merge facts so finalization can resume without rerunning completed agent work.
+Webhook IDs, pending review prompts, and checked-out feedback live in a separate owner-only file in
+the same state root. Symphony reloads that file and reconciles pending feedback after a coordinator
+restart.
+
 ### Linear adapter profile
 
 - Config: use `tracker.kind: linear` with `tracker.provider.endpoint` (default

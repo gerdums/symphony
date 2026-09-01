@@ -92,6 +92,18 @@ defmodule SymphonyElixir.Config do
     Path.expand(settings!().workspace.root, workflow_dir)
   end
 
+  @doc false
+  @spec factory_state_root(map() | nil) :: Path.t()
+  def factory_state_root(factory_settings \\ nil) do
+    factory = factory_settings || settings!().factory
+    workflow_dir = Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
+
+    case factory.state_root do
+      root when is_binary(root) and root != "" -> Path.expand(root, workflow_dir)
+      _root -> Path.join(local_workspace_root(), ".symphony-state/factory")
+    end
+  end
+
   @spec validate!() :: :ok | {:error, term()}
   def validate! do
     WorkflowStore.force_reload()
