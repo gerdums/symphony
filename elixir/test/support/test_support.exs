@@ -133,6 +133,42 @@ defmodule SymphonyElixir.TestSupport do
           codex_turn_timeout_ms: 3_600_000,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
+          factory_enabled: false,
+          factory_project_key: "project",
+          factory_command: "factory",
+          factory_args: [
+            "run",
+            "--project",
+            "{{ tracker.project_slug }}",
+            "--issue",
+            "{{ issue.identifier }}",
+            "--repository-path",
+            "{{ workspace }}",
+            "--phase",
+            "{{ phase }}"
+          ],
+          factory_phases: ["planning", "build", "review", "qa"],
+          factory_protocol_version: 1,
+          factory_phase_timeout_ms: 3_600_000,
+          factory_state_root: nil,
+          factory_proof_url_hosts: ["uploads.linear.app"],
+          factory_review_state: "In Review",
+          factory_feedback_state: "In Progress",
+          factory_review_from_states: ["In Progress"],
+          factory_github_enabled: false,
+          factory_github_repository: "example/mobile",
+          factory_github_base_branch: "main",
+          factory_github_required_check: "factory/quality-gate",
+          factory_github_check_timeout_ms: 1_800_000,
+          factory_github_check_poll_interval_ms: 10_000,
+          factory_grooming_enabled: false,
+          factory_grooming_args: [],
+          factory_grooming_timeout_ms: 300_000,
+          factory_grooming_backlog_state: "Backlog",
+          factory_grooming_todo_state: "Todo",
+          factory_post_merge_enabled: false,
+          factory_post_merge_args: [],
+          factory_post_merge_timeout_ms: 7_200_000,
           hook_after_create: nil,
           hook_before_run: nil,
           hook_after_run: nil,
@@ -190,6 +226,32 @@ defmodule SymphonyElixir.TestSupport do
     codex_turn_timeout_ms = Keyword.get(config, :codex_turn_timeout_ms)
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
+    factory_enabled = Keyword.get(config, :factory_enabled)
+    factory_project_key = Keyword.get(config, :factory_project_key)
+    factory_command = Keyword.get(config, :factory_command)
+    factory_args = Keyword.get(config, :factory_args)
+    factory_phases = Keyword.get(config, :factory_phases)
+    factory_protocol_version = Keyword.get(config, :factory_protocol_version)
+    factory_phase_timeout_ms = Keyword.get(config, :factory_phase_timeout_ms)
+    factory_state_root = Keyword.get(config, :factory_state_root)
+    factory_proof_url_hosts = Keyword.get(config, :factory_proof_url_hosts)
+    factory_review_state = Keyword.get(config, :factory_review_state)
+    factory_feedback_state = Keyword.get(config, :factory_feedback_state)
+    factory_review_from_states = Keyword.get(config, :factory_review_from_states)
+    factory_github_enabled = Keyword.get(config, :factory_github_enabled)
+    factory_github_repository = Keyword.get(config, :factory_github_repository)
+    factory_github_base_branch = Keyword.get(config, :factory_github_base_branch)
+    factory_github_required_check = Keyword.get(config, :factory_github_required_check)
+    factory_github_check_timeout_ms = Keyword.get(config, :factory_github_check_timeout_ms)
+    factory_github_check_poll_interval_ms = Keyword.get(config, :factory_github_check_poll_interval_ms)
+    factory_grooming_enabled = Keyword.get(config, :factory_grooming_enabled)
+    factory_grooming_args = Keyword.get(config, :factory_grooming_args)
+    factory_grooming_timeout_ms = Keyword.get(config, :factory_grooming_timeout_ms)
+    factory_grooming_backlog_state = Keyword.get(config, :factory_grooming_backlog_state)
+    factory_grooming_todo_state = Keyword.get(config, :factory_grooming_todo_state)
+    factory_post_merge_enabled = Keyword.get(config, :factory_post_merge_enabled)
+    factory_post_merge_args = Keyword.get(config, :factory_post_merge_args)
+    factory_post_merge_timeout_ms = Keyword.get(config, :factory_post_merge_timeout_ms)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
@@ -252,6 +314,36 @@ defmodule SymphonyElixir.TestSupport do
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
+        "factory:",
+        "  enabled: #{yaml_value(factory_enabled)}",
+        "  project_key: #{yaml_value(factory_project_key)}",
+        "  command: #{yaml_value(factory_command)}",
+        "  args: #{yaml_value(factory_args)}",
+        "  phases: #{yaml_value(factory_phases)}",
+        "  protocol_version: #{yaml_value(factory_protocol_version)}",
+        "  phase_timeout_ms: #{yaml_value(factory_phase_timeout_ms)}",
+        "  state_root: #{yaml_value(factory_state_root)}",
+        "  proof_url_hosts: #{yaml_value(factory_proof_url_hosts)}",
+        "  review_state: #{yaml_value(factory_review_state)}",
+        "  feedback_state: #{yaml_value(factory_feedback_state)}",
+        "  review_from_states: #{yaml_value(factory_review_from_states)}",
+        "  github:",
+        "    enabled: #{yaml_value(factory_github_enabled)}",
+        "    repository: #{yaml_value(factory_github_repository)}",
+        "    base_branch: #{yaml_value(factory_github_base_branch)}",
+        "    required_check: #{yaml_value(factory_github_required_check)}",
+        "    check_timeout_ms: #{yaml_value(factory_github_check_timeout_ms)}",
+        "    check_poll_interval_ms: #{yaml_value(factory_github_check_poll_interval_ms)}",
+        "  grooming:",
+        "    enabled: #{yaml_value(factory_grooming_enabled)}",
+        "    args: #{yaml_value(factory_grooming_args)}",
+        "    timeout_ms: #{yaml_value(factory_grooming_timeout_ms)}",
+        "    backlog_state: #{yaml_value(factory_grooming_backlog_state)}",
+        "    todo_state: #{yaml_value(factory_grooming_todo_state)}",
+        "  post_merge:",
+        "    enabled: #{yaml_value(factory_post_merge_enabled)}",
+        "    args: #{yaml_value(factory_post_merge_args)}",
+        "    timeout_ms: #{yaml_value(factory_post_merge_timeout_ms)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),

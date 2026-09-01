@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.Factory.Grooming
   alias SymphonyElixir.Linear.AgentBridge
   alias SymphonyElixir.Tracker.Issue
 
@@ -215,6 +216,13 @@ defmodule SymphonyElixir.Orchestrator do
       Map.get(running_entry, :run_outcome) == :terminal ->
         complete_terminal_agent_run(state, issue_id, running_entry, session_id)
 
+      Map.get(running_entry, :run_outcome) == :inactive ->
+        Logger.info("Agent worker reached a non-dispatchable state for issue_id=#{issue_id} session_id=#{session_id}; no retry scheduled")
+
+        state
+        |> complete_issue(issue_id)
+        |> release_issue_claim(issue_id)
+
       true ->
         Logger.info("Agent worker batch ended for issue_id=#{issue_id} session_id=#{session_id}; scheduling eligibility check")
 
@@ -303,7 +311,8 @@ defmodule SymphonyElixir.Orchestrator do
       |> reconcile_blocked_issues()
 
     with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
+         :ok <- maybe_groom_backlog(),
+         {:ok, issues} <- Tracker.fetch_issues_by_states(poll_state_names()) do
       choose_issues(issues, state)
     else
       {:error, :missing_linear_api_token} ->
@@ -343,6 +352,17 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         Logger.error("Failed to fetch from issue tracker: #{inspect(reason)}")
         state
+    end
+  end
+
+  defp maybe_groom_backlog do
+    case Grooming.run() do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Backlog grooming skipped after a safe failure: #{inspect(reason)}")
+        :ok
     end
   end
 
@@ -427,6 +447,23 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec session_visible_issue_for_test(Issue.t()) :: boolean()
+  def session_visible_issue_for_test(%Issue{} = issue) do
+    session_visible_issue?(issue, active_state_set(), terminal_state_set())
+  end
+
+  @doc false
+  @spec poll_state_names_for_test() :: [String.t()]
+  def poll_state_names_for_test, do: poll_state_names()
+
+  @doc false
+  @spec handle_normal_agent_down_for_test(term(), String.t(), map(), String.t() | nil) :: term()
+  def handle_normal_agent_down_for_test(%State{} = state, issue_id, running_entry, session_id)
+      when is_binary(issue_id) and is_map(running_entry) do
+    handle_agent_down(:normal, state, issue_id, running_entry, session_id)
+  end
+
+  @doc false
   @spec revalidate_issue_for_dispatch_for_test(Issue.t(), ([String.t()] -> term())) ::
           {:ok, Issue.t()} | {:skip, Issue.t() | :missing} | {:error, term()}
   def revalidate_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher)
@@ -469,6 +506,11 @@ defmodule SymphonyElixir.Orchestrator do
 
         terminate_running_issue(state, issue.id, false)
 
+      factory_review_state?(issue.state) ->
+        Logger.info("Issue reached factory review state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
+
+        terminate_running_issue(state, issue.id, false)
+
       active_issue_state?(issue.state, active_states) ->
         refresh_running_issue_state(state, issue)
 
@@ -501,6 +543,10 @@ defmodule SymphonyElixir.Orchestrator do
 
       !issue_routable?(issue) ->
         Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
+        release_issue_claim(state, issue.id)
+
+      factory_review_state?(issue.state) ->
+        Logger.info("Blocked issue reached factory review state: #{issue_context(issue)} state=#{issue.state}; releasing block")
         release_issue_claim(state, issue.id)
 
       active_issue_state?(issue.state, active_states) ->
@@ -828,7 +874,7 @@ defmodule SymphonyElixir.Orchestrator do
     terminal_states = terminal_state_set()
 
     eligible_issues =
-      Enum.filter(issues, &candidate_issue?(&1, active_states, terminal_states))
+      Enum.filter(issues, &session_visible_issue?(&1, active_states, terminal_states))
 
     :ok = AgentBridge.reconcile_open_sessions(eligible_issues)
 
@@ -881,7 +927,7 @@ defmodule SymphonyElixir.Orchestrator do
       !Map.has_key?(blocked, issue.id) and
       available_slots(state) > 0 and
       state_slots_available?(issue, running) and
-      worker_slots_available?(state)
+      factory_or_worker_slots_available?(state)
   end
 
   defp should_dispatch_issue?(_issue, _state, _active_states, _terminal_states), do: false
@@ -934,10 +980,19 @@ defmodule SymphonyElixir.Orchestrator do
     Enum.all?([id, identifier, title, state_name], &present_string?/1) and
       issue_routable?(issue) and
       active_issue_state?(state_name, active_states) and
+      !factory_review_state?(state_name) and
       !terminal_issue_state?(state_name, terminal_states)
   end
 
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
+
+  defp session_visible_issue?(%Issue{} = issue, active_states, terminal_states) do
+    candidate_issue?(issue, active_states, terminal_states) or
+      (factory_review_state?(issue.state) and issue_routable?(issue) and
+         !terminal_issue_state?(issue.state, terminal_states))
+  end
+
+  defp session_visible_issue?(_issue, _active_states, _terminal_states), do: false
 
   defp issue_routable?(%Issue{} = issue) do
     tracker = Config.settings!().tracker
@@ -981,6 +1036,25 @@ defmodule SymphonyElixir.Orchestrator do
     |> MapSet.new()
   end
 
+  defp poll_state_names do
+    settings = Config.settings!()
+
+    if settings.factory.enabled do
+      Enum.uniq(settings.tracker.active_states ++ [settings.factory.review_state])
+    else
+      settings.tracker.active_states
+    end
+  end
+
+  defp factory_review_state?(state_name) when is_binary(state_name) do
+    settings = Config.settings!()
+
+    settings.factory.enabled and
+      normalize_issue_state(state_name) == normalize_issue_state(settings.factory.review_state)
+  end
+
+  defp factory_review_state?(_state_name), do: false
+
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
     case refresh_issue_for_dispatch(issue) do
       {:ok, %Issue{} = refreshed_issue} ->
@@ -1017,14 +1091,18 @@ defmodule SymphonyElixir.Orchestrator do
   defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
     recipient = self()
 
-    case select_worker_host(state, preferred_worker_host) do
-      :no_worker_capacity ->
-        Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
-        :ok = AgentBridge.waiting_for_slot(issue)
-        state
+    if Config.settings!().factory.enabled do
+      spawn_issue_on_worker_host(state, issue, attempt, recipient, nil)
+    else
+      case select_worker_host(state, preferred_worker_host) do
+        :no_worker_capacity ->
+          Logger.debug("No SSH worker slots available for #{issue_context(issue)} preferred_worker_host=#{inspect(preferred_worker_host)}")
+          :ok = AgentBridge.waiting_for_slot(issue)
+          state
 
-      worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        worker_host ->
+          spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+      end
     end
   end
 
@@ -1269,7 +1347,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp handle_active_retry(state, issue, attempt, metadata) do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
-         worker_slots_available?(state, metadata[:worker_host]) do
+         factory_or_worker_slots_available?(state, metadata[:worker_host]) do
       case refresh_issue_for_dispatch(issue) do
         {:ok, %Issue{} = refreshed_issue} ->
           {:noreply, do_dispatch_issue(state, refreshed_issue, attempt, metadata[:worker_host])}
@@ -1368,11 +1446,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp select_worker_host(%State{} = state, preferred_worker_host) do
+    if Config.settings!().factory.enabled do
+      nil
+    else
+      select_configured_worker_host(state, preferred_worker_host)
+    end
+  end
+
+  defp select_configured_worker_host(%State{} = state, preferred_worker_host) do
     available_hosts =
       Config.settings!().worker
       |> configured_worker_hosts()
-      |> Enum.filter(&SymphonyElixir.WorkerAdmission.active?/1)
-      |> Enum.filter(&worker_host_slots_available?(state, &1))
+      |> Enum.filter(fn worker_host ->
+        SymphonyElixir.WorkerAdmission.active?(worker_host) and
+          worker_host_slots_available?(state, worker_host)
+      end)
 
     cond do
       available_hosts == [] ->
@@ -1425,6 +1513,14 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp worker_slots_available?(%State{} = state) do
     select_worker_host(state, nil) != :no_worker_capacity
+  end
+
+  defp factory_or_worker_slots_available?(%State{} = state) do
+    Config.settings!().factory.enabled or worker_slots_available?(state)
+  end
+
+  defp factory_or_worker_slots_available?(%State{} = state, preferred_worker_host) do
+    Config.settings!().factory.enabled or worker_slots_available?(state, preferred_worker_host)
   end
 
   defp worker_slots_available?(%State{} = state, preferred_worker_host) do

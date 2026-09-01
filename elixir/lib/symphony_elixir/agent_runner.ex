@@ -6,6 +6,7 @@ defmodule SymphonyElixir.AgentRunner do
   require Logger
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.Factory.Runner, as: FactoryRunner
   alias SymphonyElixir.Linear.AgentBridge
   alias SymphonyElixir.Tracker.Issue
 
@@ -23,10 +24,10 @@ defmodule SymphonyElixir.AgentRunner do
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
     # The orchestrator owns host retries so one worker lifetime never hops machines.
     worker_host =
-      if Keyword.has_key?(opts, :worker_host) do
-        Keyword.get(opts, :worker_host)
+      if Config.settings!().factory.enabled do
+        nil
       else
-        selected_worker_host(Config.settings!().worker.ssh_hosts)
+        selected_worker_host_for_run(opts)
       end
 
     Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
@@ -38,6 +39,14 @@ defmodule SymphonyElixir.AgentRunner do
       {:error, reason} ->
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
         raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"
+    end
+  end
+
+  defp selected_worker_host_for_run(opts) do
+    if Keyword.has_key?(opts, :worker_host) do
+      Keyword.get(opts, :worker_host)
+    else
+      selected_worker_host(Config.settings!().worker.ssh_hosts)
     end
   end
 
@@ -56,7 +65,7 @@ defmodule SymphonyElixir.AgentRunner do
 
       try do
         with :ok <- Workspace.run_before_run_hook(workspace, issue, worker_host) do
-          run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+          run_selected_agent(workspace, issue, codex_update_recipient, opts, worker_host)
         end
       after
         Workspace.run_after_run_hook(workspace, issue, worker_host)
@@ -66,6 +75,50 @@ defmodule SymphonyElixir.AgentRunner do
         {:error, reason}
     end
   end
+
+  defp run_selected_agent(workspace, issue, codex_update_recipient, opts, worker_host)
+       when is_binary(workspace) do
+    if Config.settings!().factory.enabled do
+      run_factory_lifecycles(workspace, issue, codex_update_recipient, opts)
+    else
+      run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host)
+    end
+  end
+
+  defp run_factory_lifecycles(workspace, issue, recipient, opts) do
+    feedback =
+      Keyword.get_lazy(opts, :review_feedback, fn -> checkout_factory_feedback(issue.id) end)
+
+    case FactoryRunner.run(issue, workspace, Keyword.put(opts, :review_feedback, feedback)) do
+      :ok ->
+        case acknowledge_factory_feedback(issue.id, feedback) do
+          {:ok, true} -> run_factory_lifecycles(workspace, issue, recipient, Keyword.delete(opts, :review_feedback))
+          {:ok, false} -> send_run_outcome(recipient, issue, :inactive)
+          {:error, _reason} = error -> error
+        end
+
+        :ok
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp checkout_factory_feedback(issue_id) when is_binary(issue_id) do
+    if Config.settings!().linear_agent.enabled,
+      do: AgentBridge.checkout_factory_feedback(issue_id),
+      else: []
+  end
+
+  defp checkout_factory_feedback(_issue_id), do: []
+
+  defp acknowledge_factory_feedback(issue_id, feedback) when is_binary(issue_id) do
+    if Config.settings!().linear_agent.enabled,
+      do: AgentBridge.acknowledge_factory_feedback(issue_id, feedback),
+      else: {:ok, false}
+  end
+
+  defp acknowledge_factory_feedback(_issue_id, _feedback), do: {:ok, false}
 
   defp prepare_workspace_with_repair(issue, codex_update_recipient, worker_host) do
     repair_attempts = Config.settings!().agent.setup_repair_attempts

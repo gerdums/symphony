@@ -380,6 +380,70 @@ defmodule SymphonyElixir.LinearAgentTest do
     assert query =~ "includeArchived: true"
   end
 
+  test "agent client adds a pull request through AgentSession addedExternalUrls" do
+    test_pid = self()
+    pr_url = "https://github.com/example/app/pull/194"
+
+    request_fun = fn payload, _headers ->
+      cond do
+        payload["query"] =~ "SymphonyAgentSessionExternalLinks" ->
+          send(test_pid, {:external_links_query, payload["variables"]})
+
+          graphql_data(%{
+            "agentSession" => %{"id" => "session-1", "externalLinks" => []}
+          })
+
+        payload["query"] =~ "SymphonyUpdateAgentSession" ->
+          send(test_pid, {:external_links_update, payload["variables"]})
+
+          graphql_data(%{
+            "agentSessionUpdate" => %{
+              "success" => true,
+              "agentSession" => %{"id" => "session-1"}
+            }
+          })
+      end
+    end
+
+    assert {:ok, %{"id" => "session-1"}} =
+             AgentClient.ensure_external_url("session-1", "Pull Request", pr_url, request_fun: request_fun)
+
+    assert_received {:external_links_query, %{"id" => "session-1"}}
+
+    assert_received {:external_links_update,
+                     %{
+                       "id" => "session-1",
+                       "input" => %{
+                         "addedExternalUrls" => [
+                           %{"label" => "Pull Request", "url" => ^pr_url}
+                         ]
+                       }
+                     }}
+  end
+
+  test "agent client does not add an external URL already present on the session" do
+    test_pid = self()
+    pr_url = "https://github.com/example/app/pull/194"
+
+    request_fun = fn payload, _headers ->
+      send(test_pid, {:external_link_request, payload["query"]})
+
+      graphql_data(%{
+        "agentSession" => %{
+          "id" => "session-1",
+          "externalLinks" => [%{"label" => "Pull Request", "url" => pr_url}]
+        }
+      })
+    end
+
+    assert {:ok, %{"id" => "session-1"}} =
+             AgentClient.ensure_external_url("session-1", "Pull Request", pr_url, request_fun: request_fun)
+
+    assert_receive {:external_link_request, query}
+    assert query =~ "SymphonyAgentSessionExternalLinks"
+    refute_receive {:external_link_request, _query}
+  end
+
   test "agent client prepares a private upload and puts the exact bytes" do
     test_pid = self()
     bytes = <<1, 2, 3, 4>>
@@ -1508,4 +1572,6 @@ defmodule SymphonyElixir.LinearAgentTest do
       25 -> Enum.reverse(acc)
     end
   end
+
+  defp graphql_data(data), do: {:ok, %{status: 200, body: %{"data" => data}}}
 end

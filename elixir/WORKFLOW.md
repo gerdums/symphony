@@ -96,6 +96,14 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - Operate autonomously end-to-end unless blocked by missing requirements, secrets, or permissions.
 - Use the blocked-access escape hatch only for true external blockers (missing required tools/auth) after exhausting documented fallbacks.
 
+## Factory change evidence
+
+- Every phase that changes repository content must emit `diff.updated` with the full 40-character commit SHA values for its contribution. A prose progress activity is not change evidence.
+- Every `phase.completed` event must report the current committed head in `commitShas` when the phase produced or inherited code changes.
+- A `pr.updated` event must use the exact issue identifier and a full `headSha` already reported for that issue. Symphony rejects cross-ticket sessions and unreported heads.
+- Symphony adds the pull-request HTTPS URL to the PR event's Agent Session and every phase Agent Session that emitted a diff. This is the public Linear API path that lets its GitHub integration populate the native Changes view.
+- Do not create synthetic historical phase sessions. Reconciliation may add a verified pull-request URL to an existing session, but it must not claim that unobserved planning, build, review, or QA work ran.
+
 ## Related skills
 
 - `linear`: interact with Linear.
@@ -108,12 +116,12 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 
 - `Backlog` -> out of scope for this workflow; do not modify.
 - `Todo` -> queued; immediately transition to `In Progress` before active work.
-  - Special case: if a PR is already attached, treat as feedback/rework loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `Human Review`).
+  - Special case: if a PR is already attached, treat as feedback/rework loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `In Review`).
 - `In Progress` -> implementation actively underway.
-- `Human Review` -> PR is attached and validated; waiting on human approval.
+- `In Review` -> implementation, review, and proof are complete; waiting on human acceptance.
 - `Merging` -> approved by human; execute the `land` skill flow (do not call `gh pr merge` directly).
 - `Rework` -> reviewer requested changes; planning + implementation required.
-- `Done` -> terminal state; no further action required.
+- `Done` -> terminal state set only by a human; no further action required.
 
 ## Step 0: Determine current ticket state and route
 
@@ -124,7 +132,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
    - `Todo` -> immediately move to `In Progress`, then ensure bootstrap workpad comment exists (create if missing), then start execution flow.
      - If PR is already attached, start by reviewing all open PR comments and deciding required changes vs explicit pushback responses.
    - `In Progress` -> continue execution flow from current scratchpad comment.
-   - `Human Review` -> wait and poll for decision/review updates.
+   - `In Review` -> wait for human acceptance. If a human requests changes, move back to `In Progress` and resume the same branch or create a fix-forward PR when the prior PR already merged.
    - `Merging` -> on entry, open and follow `.codex/skills/land/SKILL.md`; do not call `gh pr merge` directly.
    - `Rework` -> run rework flow.
    - `Done` -> do nothing and shut down.
@@ -170,7 +178,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 
 ## PR feedback sweep protocol (required)
 
-When a ticket has an attached PR, run this protocol before moving to `Human Review`:
+When a ticket has an attached PR, run this protocol before moving to `In Review`:
 
 1. Identify the PR number from issue links/attachments.
 2. Gather feedback from all channels:
@@ -189,14 +197,14 @@ When a ticket has an attached PR, run this protocol before moving to `Human Revi
 Use this only when completion is blocked by missing required tools or missing auth/permissions that cannot be resolved in-session.
 
 - GitHub is **not** a valid blocker by default. Always try fallback strategies first (alternate remote/auth mode, then continue publish/review flow).
-- Do not move to `Human Review` for GitHub access/auth until all fallback strategies have been attempted and documented in the workpad.
-- If a non-GitHub required tool is missing, or required non-GitHub auth is unavailable, move the ticket to `Human Review` with a short blocker brief in the workpad that includes:
+- Do not move to `In Review` for GitHub access/auth until all fallback strategies have been attempted and documented in the workpad.
+- If a non-GitHub required tool is missing, or required non-GitHub auth is unavailable, move the ticket to `In Review` with a short blocker brief in the workpad that includes:
   - what is missing,
   - why it blocks required acceptance/validation,
   - exact human action needed to unblock.
 - Keep the brief concise and action-oriented; do not add extra top-level comments outside the workpad.
 
-## Step 2: Execution phase (Todo -> In Progress -> Human Review)
+## Step 2: Execution phase (Todo -> In Progress -> In Review)
 
 1.  Determine current repo state (`branch`, `git status`, `HEAD`) and verify the kickoff `pull` sync result is already recorded in the workpad before implementation continues.
 2.  If current issue state is `Todo`, move it to `In Progress`; otherwise leave the current state unchanged.
@@ -227,28 +235,55 @@ Use this only when completion is blocked by missing required tools or missing au
     - Do not include PR URL in the workpad comment; keep PR linkage on the issue via attachment/link fields.
     - Add a short `### Confusions` section at the bottom when any part of task execution was unclear/confusing, with concise bullets.
     - Do not post any additional completion summary comment.
-11. Before moving to `Human Review`, poll PR feedback and checks:
+11. Before moving to `In Review`, poll PR feedback and checks:
     - Read the PR `Manual QA Plan` comment (when present) and use it to sharpen UI/runtime test coverage for the current change.
     - Run the full PR feedback sweep protocol.
     - Confirm PR checks are passing (green) after the latest changes.
     - Confirm every required ticket-provided validation/test-plan item is explicitly marked complete in the workpad.
     - Repeat this check-address-verify loop until no outstanding comments remain and checks are fully passing.
     - Re-open and refresh the workpad before state transition so `Plan`, `Acceptance Criteria`, and `Validation` exactly match completed work.
-12. Only then move issue to `Human Review`.
-    - Exception: if blocked by missing required non-GitHub tools/auth per the blocked-access escape hatch, move to `Human Review` with the blocker brief and explicit unblock actions.
+12. Only then move issue to `In Review`.
+    - Exception: if blocked by missing required non-GitHub tools/auth per the blocked-access escape hatch, move to `In Review` with the blocker brief and explicit unblock actions.
 13. For `Todo` tickets that already had a PR attached at kickoff:
     - Ensure all existing PR feedback was reviewed and resolved, including inline review comments (code changes or explicit, justified pushback response).
     - Ensure branch was pushed with any required updates.
-    - Then move to `Human Review`.
+    - Then move to `In Review`.
 
-## Step 3: Human Review and merge handling
+## Step 3: In Review and merge handling
 
-1. When the issue is in `Human Review`, do not code or change ticket content.
+1. When the issue is in `In Review`, do not code or change ticket content unless a human requests changes.
 2. Poll for updates as needed, including GitHub PR review comments from humans and bots.
-3. If review feedback requires changes, move the issue to `Rework` and follow the rework flow.
+3. If review feedback requires changes, move the issue to `In Progress` and resume the same issue workspace. Factory Agent Session prompts do this automatically and are consumed by the next factory run exactly once.
 4. If approved, human moves the issue to `Merging`.
 5. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not call `gh pr merge` directly.
-6. After merge is complete, move the issue to `Done`.
+6. After merge is complete, move the issue to `In Review`. Never move an issue to `Done`; only a human may do that.
+
+### External factory finalization
+
+When `factory.github.enabled` is true, Symphony owns the post-QA GitHub operation. Agents must not
+push or merge during the four factory phases. Before QA emits `phase.completed`, the factory must:
+
+- Commit all implementation, test, and repository-required proof-manifest files.
+- Remove temporary proof edits and leave no tracked or untracked workspace changes.
+- Make the configured `factory/quality-gate` check sufficient to validate the exact head commit.
+
+After all phases pass, Symphony pushes `HEAD` to `factory/<lowercase issue identifier>`, creates or
+reuses the matching PR, waits for the exact required check, and squash-merges that head commit. A
+missing, failed, or timed-out check stops the run. Symphony rejects `production`, `release`, and
+their child branches as merge bases. It never creates a release, deploys production, or sets `Done`.
+
+Symphony does not generate proof manifests during finalization. If a repository requires one, the
+factory must create and commit it before the gate runs. Missing or uncommitted proof fails closed.
+
+`In Review` is polled so its native Agent Sessions remain visible, but it is never an active or
+dispatchable factory state. The only factory transition into it is from a configured
+`factory.review_from_states` value after QA, merge, and the exact quality gate have all passed.
+Canceled, closed, duplicate, and `Done` issues are never overwritten. Review feedback reopens only
+to `factory.feedback_state` (`In Progress` by default).
+
+Symphony always launches the factory locally on the coordinator and bypasses its SSH worker
+admission pool. Any M1 use must be an explicit `production_build` or `cpu_heavy_background` request
+implemented behind the factory interface; Symphony itself does not route factory phases to M1.
 
 ## Step 4: Rework handling
 
@@ -262,7 +297,7 @@ Use this only when completion is blocked by missing required tools or missing au
    - Create a new bootstrap `## Codex Workpad` comment.
    - Build a fresh plan/checklist and execute end-to-end.
 
-## Completion bar before Human Review
+## Completion bar before In Review
 
 - Step 1/2 checklist is fully complete and accurately reflected in the single workpad comment.
 - Acceptance criteria and required ticket-provided validation items are complete.
@@ -286,8 +321,9 @@ Use this only when completion is blocked by missing required tools or missing au
   title/description/acceptance criteria, same-project assignment, a `related`
   link to the current issue, and `blockedBy` when the follow-up depends on the
   current issue.
-- Do not move to `Human Review` unless the `Completion bar before Human Review` is satisfied.
-- In `Human Review`, do not make changes; wait and poll.
+- Do not move to `In Review` unless the `Completion bar before In Review` is satisfied.
+- In `In Review`, do not make changes unless a human requests them. Review feedback reopens the issue to `In Progress`.
+- Never move an issue to `Done`. Only a human may set `Done`.
 - If state is terminal (`Done`), do nothing and shut down.
 - Keep issue text concise, specific, and reviewer-oriented.
 - If blocked and no workpad exists yet, add one blocker comment describing blocker, impact, and next unblock action.

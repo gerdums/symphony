@@ -10,16 +10,30 @@ defmodule SymphonyElixir.Linear.AgentBridge do
   require Logger
 
   alias SymphonyElixir.Config
+  alias SymphonyElixir.Factory.{GitHub, Policy, Protocol}
   alias SymphonyElixir.Linear.AgentClient
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixir.Tracker.Issue
+
+  @git_sha ~r/\A[0-9a-f]{40}\z/i
+  @durable_feedback_version 1
+  @max_seen_webhooks 20_000
 
   defstruct client: AgentClient,
             client_opts: [],
             orchestrator: Orchestrator,
             sessions_by_issue: %{},
             issue_by_session: %{},
+            phase_sessions_by_issue: %{},
+            phase_by_session: %{},
+            factory_agent_sessions: %{},
+            factory_roles: %{},
+            factory_issue_state: %{},
+            factory_phase_changes: %{},
+            factory_change_sessions: %{},
+            factory_issue_commits: %{},
             pending_prompts: %{},
+            factory_feedback_inflight: %{},
             proof_counts: %{},
             waiting_issues: MapSet.new(),
             waiting_session_requests: MapSet.new(),
@@ -27,7 +41,8 @@ defmodule SymphonyElixir.Linear.AgentBridge do
             open_session_reconciliation: :pending,
             work_started_issues: MapSet.new(),
             failure_notified_issues: MapSet.new(),
-            seen_webhooks: MapSet.new()
+            seen_webhooks: MapSet.new(),
+            durable_feedback_path: nil
 
   @type state :: %__MODULE__{}
 
@@ -37,15 +52,73 @@ defmodule SymphonyElixir.Linear.AgentBridge do
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
-  @spec accept_webhook(map(), GenServer.server()) :: :ok
+  @spec accept_webhook(map(), GenServer.server()) :: :ok | {:error, term()}
   def accept_webhook(payload, server \\ __MODULE__) when is_map(payload) do
-    GenServer.cast(server, {:accept_webhook, payload})
+    GenServer.call(server, {:accept_webhook, payload}, 35_000)
   end
 
   @spec ensure_session(Issue.t(), GenServer.server()) ::
           {:ok, String.t()} | {:error, term()} | :disabled
   def ensure_session(%Issue{} = issue, server \\ __MODULE__) do
     GenServer.call(server, {:ensure_session, issue}, 35_000)
+  end
+
+  @spec ensure_phase_session(Issue.t(), String.t(), GenServer.server()) ::
+          {:ok, String.t()} | {:error, term()} | :disabled
+  def ensure_phase_session(%Issue{} = issue, phase, server \\ __MODULE__)
+      when phase in ["planning", "build", "review", "qa"] do
+    GenServer.call(server, {:ensure_phase_session, issue, phase}, 35_000)
+  end
+
+  @spec report_grooming_decision(Issue.t(), map(), GenServer.server()) :: :ok | {:error, term()}
+  def report_grooming_decision(%Issue{} = issue, decision, server \\ __MODULE__)
+      when is_map(decision) do
+    GenServer.call(server, {:report_grooming_decision, issue, decision}, 35_000)
+  end
+
+  @spec register_phase_session(String.t(), String.t(), String.t(), GenServer.server()) :: :ok
+  def register_phase_session(issue_id, phase, session_id, server \\ __MODULE__)
+      when is_binary(issue_id) and phase in ["planning", "build", "review", "qa"] and
+             is_binary(session_id) do
+    GenServer.call(server, {:register_phase_session, issue_id, phase, session_id})
+  end
+
+  @spec ensure_factory_agent_session(Issue.t(), String.t(), String.t(), String.t(), GenServer.server()) ::
+          {:ok, String.t()} | {:error, term()}
+  def ensure_factory_agent_session(%Issue{} = issue, phase, agent_id, role, server \\ __MODULE__)
+      when is_binary(agent_id) and is_binary(role) do
+    GenServer.call(server, {:ensure_factory_agent_session, issue, phase, agent_id, role}, 35_000)
+  end
+
+  @spec register_factory_agent_session(String.t(), String.t(), String.t(), String.t(), GenServer.server()) :: :ok
+  def register_factory_agent_session(issue_id, phase, agent_id, session_id, server \\ __MODULE__)
+      when is_binary(issue_id) and is_binary(agent_id) and is_binary(session_id) do
+    GenServer.call(server, {:register_factory_agent_session, issue_id, phase, agent_id, session_id})
+  end
+
+  @spec report_factory_event(Issue.t(), String.t(), map(), GenServer.server()) ::
+          :ok | {:error, term()} | :disabled
+  def report_factory_event(%Issue{} = issue, session_id, event, server \\ __MODULE__)
+      when is_binary(session_id) and is_map(event) do
+    GenServer.call(server, {:factory_event, issue, session_id, event}, 35_000)
+  end
+
+  @spec complete_factory_lifecycle(Issue.t(), GenServer.server()) :: :ok | {:error, term()}
+  def complete_factory_lifecycle(%Issue{} = issue, server \\ __MODULE__) do
+    GenServer.call(server, {:complete_factory_lifecycle, issue}, 35_000)
+  end
+
+  @spec restore_factory_lifecycle(Issue.t(), map(), GenServer.server()) :: :ok | {:error, term()}
+  def restore_factory_lifecycle(%Issue{} = issue, facts, server \\ __MODULE__) when is_map(facts) do
+    GenServer.call(server, {:restore_factory_lifecycle, issue, facts}, 35_000)
+  end
+
+  @doc false
+  @spec restore_factory_event(Issue.t(), String.t(), map(), GenServer.server()) ::
+          :ok | {:error, term()}
+  def restore_factory_event(%Issue{} = issue, session_id, event, server \\ __MODULE__)
+      when is_binary(session_id) and is_map(event) do
+    GenServer.call(server, {:restore_factory_event, issue, session_id, event}, 35_000)
   end
 
   @spec waiting_for_slot(Issue.t(), GenServer.server()) :: :ok
@@ -101,6 +174,23 @@ defmodule SymphonyElixir.Linear.AgentBridge do
   @spec take_prompt(String.t(), GenServer.server()) :: {:ok, map()} | :empty
   def take_prompt(issue_id, server \\ __MODULE__) when is_binary(issue_id) do
     GenServer.call(server, {:take_prompt, issue_id}, :infinity)
+  end
+
+  @spec take_prompts(String.t(), GenServer.server()) :: [map()]
+  def take_prompts(issue_id, server \\ __MODULE__) when is_binary(issue_id) do
+    GenServer.call(server, {:take_prompts, issue_id}, :infinity)
+  end
+
+  @spec checkout_factory_feedback(String.t(), GenServer.server()) :: [map()]
+  def checkout_factory_feedback(issue_id, server \\ __MODULE__) when is_binary(issue_id) do
+    GenServer.call(server, {:checkout_factory_feedback, issue_id}, :infinity)
+  end
+
+  @spec acknowledge_factory_feedback(String.t(), [map()], GenServer.server()) ::
+          {:ok, boolean()} | {:error, term()}
+  def acknowledge_factory_feedback(issue_id, feedback, server \\ __MODULE__)
+      when is_binary(issue_id) and is_list(feedback) do
+    GenServer.call(server, {:acknowledge_factory_feedback, issue_id, feedback}, :infinity)
   end
 
   @spec report_codex_update(String.t(), map(), GenServer.server()) :: :ok
@@ -159,18 +249,45 @@ defmodule SymphonyElixir.Linear.AgentBridge do
       - Before claiming completion or moving the issue to a terminal state, call `linear_agent_proof` with at least #{minimum} screenshot(s) from the current workspace.
       - Screenshot proof is mandatory. Capture the changed behavior or the strongest visual validation available, and include a concise caption explaining what it proves.
       - Follow-up prompts sent from the Linear agent session are live instructions for this same run.
+      - Never move an issue to `Done`. The final factory state is `In Review`, and only a human may set `Done`.
       """
     end
   end
 
   @impl true
   def init(opts) do
-    {:ok,
-     %__MODULE__{
-       client: Keyword.get(opts, :client, AgentClient),
-       client_opts: Keyword.get(opts, :client_opts, []),
-       orchestrator: Keyword.get(opts, :orchestrator, Orchestrator)
-     }}
+    durable_path =
+      case Keyword.fetch(opts, :durable_feedback_path) do
+        {:ok, path} ->
+          path
+
+        :error ->
+          if Config.settings!().factory.enabled,
+            do: Config.factory_state_root() |> Path.join("linear-feedback-v1.json"),
+            else: nil
+      end
+
+    case load_durable_feedback(durable_path) do
+      {:ok, durable} ->
+        state = %__MODULE__{
+          client: Keyword.get(opts, :client, AgentClient),
+          client_opts: Keyword.get(opts, :client_opts, []),
+          orchestrator: Keyword.get(opts, :orchestrator, Orchestrator),
+          pending_prompts: durable.pending_prompts,
+          factory_feedback_inflight: durable.factory_feedback_inflight,
+          seen_webhooks: durable.seen_webhooks,
+          durable_feedback_path: durable_path
+        }
+
+        if map_size(state.pending_prompts) > 0 or map_size(state.factory_feedback_inflight) > 0 do
+          Process.send_after(self(), :reconcile_durable_factory_feedback, 0)
+        end
+
+        {:ok, state}
+
+      {:error, reason} ->
+        {:stop, {:durable_factory_feedback_unavailable, reason}}
+    end
   end
 
   @impl true
@@ -189,6 +306,185 @@ defmodule SymphonyElixir.Linear.AgentBridge do
           {:ok, session_id, state} -> {:reply, {:ok, session_id}, state}
           {:error, reason, state} -> {:reply, {:error, reason}, state}
         end
+    end
+  end
+
+  def handle_call({:ensure_phase_session, %Issue{id: issue_id}, phase}, _from, state) do
+    case ensure_phase_session_in_state(state, issue_id, phase) do
+      {:ok, session_id, next_state} -> {:reply, {:ok, session_id}, next_state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+      :disabled -> {:reply, :disabled, state}
+    end
+  end
+
+  def handle_call({:register_phase_session, issue_id, phase, session_id}, _from, state) do
+    {:reply, :ok, put_phase_session(state, issue_id, phase, session_id)}
+  end
+
+  def handle_call(
+        {:report_grooming_decision, %Issue{id: issue_id, title: title}, decision},
+        _from,
+        state
+      ) do
+    to_state = decision["to"]
+    acceptance_criteria = decision["acceptanceCriteria"] || []
+
+    plan =
+      [
+        decision["summary"] || title || "Groom backlog ticket",
+        Enum.map(acceptance_criteria, &"Acceptance: #{&1}"),
+        "Routing: #{decision["reason"]}"
+      ]
+      |> List.flatten()
+      |> Enum.map(&%{"content" => safe_activity_text(&1, 1_000), "status" => "completed"})
+
+    with :ok <- Policy.allow_transition(to_state),
+         :ok <- require_non_terminal_factory_state(to_state, ["Done"]),
+         {:ok, session_id, next_state} <- ensure_phase_session_in_state(state, issue_id, "planning"),
+         {:ok, _session} <-
+           next_state.client.update_session(
+             session_id,
+             %{"plan" => plan},
+             client_opts(next_state)
+           ),
+         :ok <-
+           create_activity(next_state, session_id, %{
+             "type" => "action",
+             "action" => "Backlog grooming: #{decision["from"]} → #{to_state}",
+             "parameter" =>
+               safe_activity_text(
+                 Enum.join(
+                   [decision["summary"], decision["reason"]] ++ acceptance_criteria,
+                   "\n"
+                 ),
+                 1_000
+               )
+           }),
+         {:ok, _issue} <-
+           next_state.client.transition_issue_from(
+             issue_id,
+             Enum.uniq([decision["from"], to_state]),
+             to_state,
+             client_opts(next_state)
+           ) do
+      {:reply, :ok, next_state}
+    else
+      {:error, reason} -> {:reply, {:error, reason}, state}
+      other -> {:reply, {:error, {:invalid_grooming_result, other}}, state}
+    end
+  end
+
+  def handle_call({:ensure_factory_agent_session, %Issue{id: issue_id}, phase, agent_id, role}, _from, state) do
+    key = {issue_id, phase, agent_id}
+
+    case state.factory_agent_sessions[key] do
+      session_id when is_binary(session_id) ->
+        {:reply, {:ok, session_id}, state}
+
+      _missing ->
+        event = %{"eventId" => agent_id, "phase" => phase, "payload" => %{"role" => role}}
+
+        case create_factory_agent_session(state, issue_id, phase, agent_id, event) do
+          {:ok, session_id, next_state} -> {:reply, {:ok, session_id}, next_state}
+          {:error, reason} -> {:reply, {:error, reason}, state}
+        end
+    end
+  end
+
+  def handle_call({:register_factory_agent_session, issue_id, phase, agent_id, session_id}, _from, state) do
+    key = {issue_id, phase, agent_id}
+
+    next_state = %{
+      state
+      | factory_agent_sessions: Map.put(state.factory_agent_sessions, key, session_id),
+        phase_by_session: Map.put(state.phase_by_session, session_id, {issue_id, phase})
+    }
+
+    {:reply, :ok, next_state}
+  end
+
+  def handle_call({:factory_event, %Issue{} = issue, session_id, event}, _from, state) do
+    case validate_factory_event_binding(state, issue, session_id, event) do
+      :ok ->
+        with {:ok, event_session_id, next_state} <-
+               route_factory_event_session(state, issue, event),
+             {event, next_state} <- decorate_factory_event(next_state, issue.id, event),
+             next_state <-
+               record_factory_event_state(next_state, issue.id, event, event_session_id),
+             :ok <- publish_factory_event(next_state, issue.id, event_session_id, event),
+             :ok <- maybe_transition_after_factory_event(next_state, issue) do
+          {:reply, :ok, put_phase_session(next_state, issue.id, event["phase"], session_id)}
+        else
+          {:error, reason} -> {:reply, {:error, reason}, state}
+        end
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:restore_factory_event, %Issue{} = issue, session_id, event}, _from, state) do
+    case validate_factory_event_binding(state, issue, session_id, event) do
+      :ok ->
+        case route_factory_event_session(state, issue, event) do
+          {:ok, event_session_id, next_state} ->
+            {event, next_state} = decorate_factory_event(next_state, issue.id, event)
+            next_state = record_factory_event_state(next_state, issue.id, event, event_session_id)
+            {:reply, :ok, put_phase_session(next_state, issue.id, event["phase"], session_id)}
+
+          {:error, reason} ->
+            {:reply, {:error, reason}, state}
+        end
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:complete_factory_lifecycle, %Issue{id: issue_id}}, _from, state) do
+    issue_state = Map.get(state.factory_issue_state, issue_id, %{})
+
+    cond do
+      !factory_lifecycle_ready?(issue_state) ->
+        {:reply, {:error, :factory_qa_not_completed}, state}
+
+      unprocessed_factory_feedback?(state, issue_id) ->
+        {:reply, :ok, state}
+
+      true ->
+        {:reply, transition_to_review(state, issue_id), state}
+    end
+  end
+
+  def handle_call({:accept_webhook, payload}, _from, state) do
+    next_state = handle_webhook(payload, state)
+
+    case persist_webhook_state(next_state) do
+      {:ok, persisted_state} -> {:reply, :ok, persisted_state}
+      {:error, reason} -> {:reply, {:error, {:webhook_not_persisted, reason}}, state}
+    end
+  end
+
+  def handle_call({:restore_factory_lifecycle, %Issue{id: issue_id}, facts}, _from, state) do
+    case validate_lifecycle_facts(facts) do
+      {:ok, normalized} ->
+        next_state = %{
+          state
+          | factory_issue_state: Map.put(state.factory_issue_state, issue_id, normalized),
+            factory_issue_commits:
+              restore_factory_issue_commit(
+                state.factory_issue_commits,
+                issue_id,
+                normalized.integrated_head
+              )
+        }
+
+        next_state = restore_factory_change_bindings(next_state, issue_id, normalized.change_bindings)
+
+        {:reply, :ok, next_state}
+
+      {:error, _reason} = error ->
+        {:reply, error, state}
     end
   end
 
@@ -225,13 +521,12 @@ defmodule SymphonyElixir.Linear.AgentBridge do
         {:reply, {:error, :missing_linear_agent_session}, state}
 
       true ->
-        case maybe_assign_issue_to_app(state, issue_id, settings) do
-          :ok ->
-            state = announce_work_started(state, issue_id)
-            {:reply, :ok, state}
-
-          {:error, _reason} = error ->
-            {:reply, error, state}
+        with :ok <- begin_factory_work(state, issue_id),
+             :ok <- maybe_assign_issue_to_app(state, issue_id, settings) do
+          state = announce_work_started(state, issue_id)
+          {:reply, :ok, state}
+        else
+          {:error, _reason} = error -> {:reply, error, state}
         end
     end
   end
@@ -250,10 +545,66 @@ defmodule SymphonyElixir.Linear.AgentBridge do
             Map.put(state.pending_prompts, issue_id, rest)
           end
 
-        {:reply, {:ok, prompt}, %{state | pending_prompts: pending_prompts}}
+        next_state = %{state | pending_prompts: pending_prompts}
+        {:reply, {:ok, prompt}, persist_durable_feedback(next_state)}
 
       [] ->
         {:reply, :empty, state}
+    end
+  end
+
+  def handle_call({:take_prompts, issue_id}, _from, state) do
+    prompts = Map.get(state.pending_prompts, issue_id, [])
+    next_state = %{state | pending_prompts: Map.delete(state.pending_prompts, issue_id)}
+    {:reply, prompts, persist_durable_feedback(next_state)}
+  end
+
+  def handle_call({:checkout_factory_feedback, issue_id}, _from, state) do
+    case Map.get(state.factory_feedback_inflight, issue_id) do
+      feedback when is_list(feedback) and feedback != [] ->
+        {:reply, feedback, state}
+
+      _none ->
+        feedback = Map.get(state.pending_prompts, issue_id, [])
+
+        inflight =
+          if feedback == [] do
+            state.factory_feedback_inflight
+          else
+            Map.put(state.factory_feedback_inflight, issue_id, feedback)
+          end
+
+        next_state = %{state | factory_feedback_inflight: inflight}
+        {:reply, feedback, persist_durable_feedback(next_state)}
+    end
+  end
+
+  def handle_call({:acknowledge_factory_feedback, issue_id, feedback}, _from, state) do
+    acknowledged_ids = feedback |> Enum.map(&prompt_entry_id/1) |> MapSet.new()
+
+    remaining =
+      state.pending_prompts
+      |> Map.get(issue_id, [])
+      |> Enum.reject(&MapSet.member?(acknowledged_ids, prompt_entry_id(&1)))
+
+    pending_prompts =
+      if remaining == [],
+        do: Map.delete(state.pending_prompts, issue_id),
+        else: Map.put(state.pending_prompts, issue_id, remaining)
+
+    next_state = %{
+      state
+      | pending_prompts: pending_prompts,
+        factory_feedback_inflight: Map.delete(state.factory_feedback_inflight, issue_id)
+    }
+
+    if remaining == [] do
+      {:reply, {:ok, false}, persist_durable_feedback(next_state)}
+    else
+      case reopen_for_feedback(state, issue_id) do
+        :ok -> {:reply, {:ok, true}, persist_durable_feedback(next_state)}
+        {:error, reason} -> {:reply, {:error, {:factory_feedback_reopen_failed, reason}}, state}
+      end
     end
   end
 
@@ -312,21 +663,17 @@ defmodule SymphonyElixir.Linear.AgentBridge do
 
   @impl true
   def handle_cast({:close, issue_id, summary}, state) do
-    case session_id(state, issue_id) do
-      nil ->
+    case session_ids_for_issue(state, issue_id) do
+      [] ->
         {:noreply, state}
 
-      agent_session_id ->
+      session_ids ->
         run_async(fn ->
-          close_session(state, issue_id, agent_session_id, summary)
+          close_sessions(state, issue_id, session_ids, summary)
         end)
 
-        {:noreply, delete_session(state, issue_id, agent_session_id)}
+        {:noreply, delete_issue_sessions(state, issue_id, session_ids)}
     end
-  end
-
-  def handle_cast({:accept_webhook, payload}, state) do
-    {:noreply, handle_webhook(payload, state)}
   end
 
   def handle_cast({:waiting_for_slot, %Issue{id: issue_id}}, state) when is_binary(issue_id) do
@@ -472,6 +819,36 @@ defmodule SymphonyElixir.Linear.AgentBridge do
 
         {:noreply, mark_existing_waiting_session_checked(state, issue_id)}
     end
+  end
+
+  def handle_info({:factory_feedback_reopen_result, issue_id, _attempt, :ok}, state) do
+    notify_orchestrator(state.orchestrator, issue_id)
+    {:noreply, state}
+  end
+
+  def handle_info({:factory_feedback_reopen_result, issue_id, attempt, {:error, reason}}, state) do
+    Logger.warning("Unable to reopen Linear issue after review feedback issue_id=#{issue_id}: #{inspect(reason)}")
+    Process.send_after(self(), {:retry_factory_feedback_reopen, issue_id, attempt + 1}, feedback_retry_ms(attempt))
+    {:noreply, state}
+  end
+
+  def handle_info({:retry_factory_feedback_reopen, issue_id, attempt}, state) do
+    if Map.get(state.pending_prompts, issue_id, []) == [] do
+      {:noreply, state}
+    else
+      reopen_for_feedback_async(state, issue_id, attempt)
+      {:noreply, state}
+    end
+  end
+
+  def handle_info(:reconcile_durable_factory_feedback, state) do
+    issue_ids =
+      Map.keys(state.pending_prompts)
+      |> Enum.concat(Map.keys(state.factory_feedback_inflight))
+      |> Enum.uniq()
+
+    Enum.each(issue_ids, &reopen_for_feedback_async(state, &1, 1))
+    {:noreply, state}
   end
 
   defp reconcile_open_session_result(state, eligible_issue_ids, {:ok, sessions})
@@ -656,11 +1033,31 @@ defmodule SymphonyElixir.Linear.AgentBridge do
         action: action
       }
 
-      pending_prompts = Map.update(state.pending_prompts, issue_id, [prompt_entry], &(&1 ++ [prompt_entry]))
-      notify_orchestrator(state.orchestrator, issue_id)
-      %{state | pending_prompts: pending_prompts}
+      {state, new_prompt?} = put_new_factory_prompt(state, issue_id, prompt_entry)
+      if new_prompt?, do: notify_new_factory_prompt(state, issue_id)
+
+      state
     else
       _ -> state
+    end
+  end
+
+  defp put_new_factory_prompt(state, issue_id, prompt_entry) do
+    if known_prompt?(state, issue_id, prompt_entry.id) do
+      {state, false}
+    else
+      pending_prompts =
+        Map.update(state.pending_prompts, issue_id, [prompt_entry], &(&1 ++ [prompt_entry]))
+
+      {%{state | pending_prompts: pending_prompts}, true}
+    end
+  end
+
+  defp notify_new_factory_prompt(state, issue_id) do
+    if Config.settings!().factory.enabled do
+      reopen_for_feedback_async(state, issue_id, 1)
+    else
+      notify_orchestrator(state.orchestrator, issue_id)
     end
   end
 
@@ -883,6 +1280,709 @@ defmodule SymphonyElixir.Linear.AgentBridge do
     end
   end
 
+  defp initialize_phase_session(state, session_id, phase) do
+    if phase in Protocol.phases() do
+      phase_name = phase_name(phase)
+
+      with {:ok, _session} <-
+             state.client.update_session(
+               session_id,
+               %{
+                 "plan" => [
+                   %{"content" => "#{phase_name} phase", "status" => "inProgress"}
+                 ]
+               },
+               client_opts(state)
+             ) do
+        create_activity(state, session_id, %{
+          "type" => "thought",
+          "body" => "#{phase_name} phase is ready. Factory events for this phase appear in this session."
+        })
+      end
+    else
+      {:error, {:unsupported_factory_phase, phase}}
+    end
+  end
+
+  defp publish_factory_event(state, _issue_id, session_id, %{
+         "type" => "plan.updated",
+         "payload" => payload
+       }) do
+    plan = factory_plan(payload)
+
+    case state.client.update_session(session_id, %{"plan" => plan}, client_opts(state)) do
+      {:ok, _session} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp publish_factory_event(
+         state,
+         issue_id,
+         session_id,
+         %{
+           "type" => "pr.updated",
+           "payload" => payload
+         } = event
+       ) do
+    case Map.get(payload, "url") do
+      nil ->
+        create_activity(state, session_id, factory_activity(event))
+
+      url ->
+        publish_factory_pr_url(state, issue_id, session_id, event, url)
+    end
+  end
+
+  defp publish_factory_event(
+         state,
+         _issue_id,
+         session_id,
+         %{"type" => "artifact.created", "payload" => %{"artifact" => artifact}} = event
+       ) do
+    with :ok <- require_factory_artifact_url(artifact["uri"], "artifact.uri") do
+      create_activity(state, session_id, factory_activity(event))
+    end
+  end
+
+  defp publish_factory_event(
+         state,
+         issue_id,
+         session_id,
+         %{
+           "type" => "check.completed",
+           "payload" => %{"name" => "post-merge/internal-build", "url" => url}
+         } = event
+       ) do
+    with :ok <- GitHub.validate_actions_run_url(url, Config.settings!().factory.github.repository),
+         :ok <- ensure_factory_url_on_sessions(state, issue_id, session_id, "Internal Build", url) do
+      create_activity(state, session_id, factory_activity(event))
+    end
+  end
+
+  defp publish_factory_event(state, _issue_id, session_id, event) do
+    case factory_activity(event) do
+      nil -> :ok
+      content -> create_activity(state, session_id, content)
+    end
+  end
+
+  defp publish_factory_pr_url(state, issue_id, session_id, event, url) do
+    with :ok <- GitHub.validate_pull_request_url(url, Config.settings!().factory.github.repository),
+         :ok <- ensure_pull_request_url_on_sessions(state, issue_id, session_id, url) do
+      create_activity(state, session_id, factory_activity(event))
+    end
+  end
+
+  defp ensure_pull_request_url_on_sessions(state, issue_id, event_session_id, url) do
+    ensure_factory_url_on_sessions(state, issue_id, event_session_id, "Pull Request", url)
+  end
+
+  defp ensure_factory_url_on_sessions(state, issue_id, event_session_id, label, url) do
+    state
+    |> factory_change_session_ids(issue_id, event_session_id)
+    |> Enum.reduce_while(:ok, fn session_id, :ok ->
+      case state.client.ensure_external_url(
+             session_id,
+             label,
+             url,
+             client_opts(state)
+           ) do
+        {:ok, _session} -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, {:factory_session_link_failed, session_id, reason}}}
+      end
+    end)
+  end
+
+  defp factory_change_session_ids(state, issue_id, event_session_id) do
+    changed_session_ids =
+      state.factory_change_sessions
+      |> Enum.flat_map(fn
+        {{^issue_id, _phase, _agent_id}, session_id} when is_binary(session_id) ->
+          [session_id]
+
+        {_key, _session_id} ->
+          []
+      end)
+
+    [event_session_id | changed_session_ids]
+    |> Enum.uniq()
+  end
+
+  defp factory_activity(%{
+         "type" => "phase.started",
+         "phase" => phase,
+         "role" => role,
+         "payload" => payload
+       }) do
+    details =
+      [Map.get(payload, "packet"), Map.get(payload, "branch")]
+      |> Enum.filter(&is_binary/1)
+      |> Enum.join(" on ")
+      |> default_activity_label("Factory phase started")
+
+    action_activity("#{phase_name(phase)} started", role_text(role, details))
+  end
+
+  defp factory_activity(%{"type" => "agent.started", "role" => role, "payload" => payload}) do
+    provider = Map.get(payload, "provider", "agent")
+    model = Map.get(payload, "model", "unknown model")
+    access = if Map.get(payload, "readOnly"), do: "read-only", else: "write-enabled"
+    action_activity("#{role_name(role)} started", "#{provider} / #{model} / #{access}")
+  end
+
+  defp factory_activity(%{"type" => "progress", "role" => role, "payload" => payload}) do
+    case Map.get(payload, "message") do
+      message when is_binary(message) -> thought_activity(role_text(role, message))
+      _ -> nil
+    end
+  end
+
+  defp factory_activity(%{"type" => "diff.updated", "role" => role, "payload" => payload}) do
+    files = Map.get(payload, "filesChanged", 0)
+    additions = Map.get(payload, "insertions", 0)
+    deletions = Map.get(payload, "deletions", 0)
+    commit_shas = Map.get(payload, "commitShas", [])
+
+    commit_result =
+      case commit_shas do
+        [] -> "No commit SHA reported yet. The phase remains unlinked until a matching PR is published."
+        shas -> "Commits: " <> Enum.map_join(shas, ", ", &"`#{&1}`")
+      end
+
+    %{
+      "type" => "action",
+      "action" => "#{role_name(role)} recorded code changes",
+      "parameter" => "#{files} files",
+      "result" => safe_activity_text("+#{additions} -#{deletions} lines\n\n#{commit_result}", 4_000)
+    }
+  end
+
+  defp factory_activity(%{"type" => "check.completed", "role" => role, "payload" => payload}) do
+    name = Map.get(payload, "name", "Check")
+    status = Map.get(payload, "status", "unknown")
+    details = Map.get(payload, "summary") || Map.get(payload, "command") || status
+
+    if status in ["failed", "error"] do
+      %{"type" => "error", "body" => role_text(role, "#{name} failed. #{details}")}
+    else
+      action_activity("#{name}: #{status}", role_text(role, to_string(details)))
+    end
+  end
+
+  defp factory_activity(%{
+         "type" => "artifact.created",
+         "role" => role,
+         "payload" => %{"artifact" => artifact}
+       }) do
+    kind = Map.get(artifact, "kind", "artifact")
+    url = Map.get(artifact, "uri")
+    caption = safe_activity_text(Map.get(artifact, "description", "Factory proof"), 1_000)
+
+    cond do
+      kind == "image" ->
+        %{
+          "type" => "thought",
+          "body" => role_text(role, "#{caption}\n\n![#{escape_alt_text(caption)}](#{url})")
+        }
+
+      kind == "video" ->
+        %{
+          "type" => "thought",
+          "body" => role_text(role, "[Video proof: #{caption}](#{url})")
+        }
+
+      true ->
+        %{"type" => "thought", "body" => role_text(role, "[#{caption}](#{url})")}
+    end
+  end
+
+  defp factory_activity(%{"type" => "pr.updated", "role" => role, "payload" => payload}) do
+    number = if is_integer(payload["number"]), do: " ##{payload["number"]}", else: ""
+    state = Map.get(payload, "state", "updated")
+    quality = get_in(payload, ["qualityCheck", "status"])
+    quality_text = if is_binary(quality), do: " Quality gate: #{quality}.", else: ""
+    thought_activity(role_text(role, "Pull request#{number} is #{state}.#{quality_text}"))
+  end
+
+  defp factory_activity(%{"type" => "phase.completed", "phase" => phase, "role" => role, "payload" => payload}) do
+    summary = Map.get(payload, "summary", "#{phase_name(phase)} phase completed.")
+    response_activity(role_text(role, summary))
+  end
+
+  defp factory_activity(%{"type" => "phase.failed", "phase" => phase, "role" => role, "payload" => payload}) do
+    message = Map.get(payload, "error", "#{phase_name(phase)} phase failed.")
+    %{"type" => "error", "body" => role_text(role, message)}
+  end
+
+  defp factory_activity(%{"type" => "blocked", "role" => role, "payload" => payload}) do
+    reason = Map.get(payload, "reason", "The factory needs input before it can continue.")
+    message = if is_binary(payload["action"]), do: "#{reason} Action: #{payload["action"]}", else: reason
+    %{"type" => "elicitation", "body" => role_text(role, message)}
+  end
+
+  defp factory_activity(_event), do: nil
+
+  defp factory_plan(payload) do
+    summary = Map.get(payload, "summary")
+
+    summary_step =
+      if is_binary(summary) do
+        [%{"content" => safe_activity_text(summary, 1_000), "status" => "completed"}]
+      else
+        []
+      end
+
+    criteria =
+      payload
+      |> Map.get("acceptanceCriteria", [])
+      |> Enum.filter(&is_binary/1)
+      |> Enum.map(&%{"content" => safe_activity_text(&1, 1_000), "status" => "pending"})
+
+    summary_step ++ criteria
+  end
+
+  defp maybe_transition_after_factory_event(state, %Issue{id: issue_id}) do
+    _issue_state = Map.get(state.factory_issue_state, issue_id, %{})
+    :ok
+  end
+
+  defp transition_to_review(state, issue_id) do
+    settings = Config.settings!()
+    factory = settings.factory
+
+    allowed_states =
+      factory.review_from_states
+      |> Enum.concat([factory.review_state])
+      |> Enum.uniq()
+      |> Enum.reject(&terminal_factory_state?(&1, settings.tracker.terminal_states))
+
+    with {:ok, state_name} <- Policy.review_state(factory),
+         :ok <- require_non_terminal_factory_state(state_name, settings.tracker.terminal_states),
+         {:ok, _issue} <-
+           state.client.transition_issue_from(
+             issue_id,
+             allowed_states,
+             state_name,
+             client_opts(state)
+           ) do
+      :ok
+    end
+  end
+
+  defp route_factory_event_session(
+         state,
+         %Issue{id: issue_id},
+         %{"type" => "agent.started", "phase" => phase} = event
+       ) do
+    agent_id = factory_agent_id(event)
+    key = {issue_id, phase, agent_id}
+
+    case state.factory_agent_sessions[key] do
+      session_id when is_binary(session_id) ->
+        {:ok, session_id, state}
+
+      _missing ->
+        create_factory_agent_session(state, issue_id, phase, agent_id, event)
+    end
+  end
+
+  defp route_factory_event_session(
+         state,
+         %Issue{id: issue_id},
+         %{"agentId" => agent_id, "phase" => phase}
+       )
+       when is_binary(agent_id) do
+    case state.factory_agent_sessions[{issue_id, phase, agent_id}] do
+      session_id when is_binary(session_id) -> {:ok, session_id, state}
+      _missing -> {:error, {:factory_agent_session_missing, agent_id}}
+    end
+  end
+
+  defp route_factory_event_session(state, %Issue{id: issue_id}, event) do
+    phase = event["phase"]
+
+    case state.phase_sessions_by_issue |> Map.get(issue_id, %{}) |> Map.get(phase) do
+      session_id when is_binary(session_id) -> {:ok, session_id, state}
+      _missing -> {:error, :factory_phase_session_not_registered}
+    end
+  end
+
+  defp create_factory_agent_session(state, issue_id, phase, agent_id, event) do
+    role = get_in(event, ["payload", "role"]) || phase
+
+    case state.client.create_session(issue_id, client_opts(state)) do
+      {:ok, %{"id" => session_id}} when is_binary(session_id) ->
+        content = "#{phase_name(phase)} · #{role_name(role)} agent"
+
+        with {:ok, _session} <-
+               state.client.update_session(
+                 session_id,
+                 %{"plan" => [%{"content" => content, "status" => "inProgress"}]},
+                 client_opts(state)
+               ) do
+          key = {issue_id, phase, agent_id}
+
+          next_state = %{
+            state
+            | factory_agent_sessions: Map.put(state.factory_agent_sessions, key, session_id),
+              phase_by_session: Map.put(state.phase_by_session, session_id, {issue_id, phase})
+          }
+
+          {:ok, session_id, next_state}
+        end
+
+      {:error, reason} ->
+        {:error, {:factory_agent_session_create_failed, reason}}
+
+      other ->
+        {:error, {:invalid_agent_session_response, other}}
+    end
+  end
+
+  defp factory_agent_id(%{"agentId" => agent_id}) when is_binary(agent_id), do: agent_id
+  defp factory_agent_id(%{"eventId" => event_id}), do: event_id
+
+  defp validate_factory_event_binding(
+         state,
+         %Issue{id: issue_id, identifier: identifier},
+         session_id,
+         event
+       ) do
+    with true <- event["issue"] == identifier,
+         true <- event["project"] == Config.settings!().factory.project_key,
+         {^issue_id, phase} <- state.phase_by_session[session_id],
+         true <- event["phase"] == phase,
+         :ok <- validate_factory_commit_shas(event),
+         :ok <- validate_factory_pr_head(state, issue_id, event) do
+      :ok
+    else
+      false -> {:error, :factory_event_binding_mismatch}
+      nil -> {:error, :factory_phase_session_not_registered}
+      {:error, _reason} = error -> error
+      {_other_issue_id, _other_phase} -> {:error, :factory_event_binding_mismatch}
+    end
+  end
+
+  defp validate_factory_commit_shas(%{
+         "type" => type,
+         "payload" => %{"commitShas" => commit_shas}
+       })
+       when type in ["diff.updated", "phase.completed"] and is_list(commit_shas) do
+    if Enum.all?(commit_shas, &(is_binary(&1) and Regex.match?(@git_sha, &1))) do
+      :ok
+    else
+      {:error, :invalid_factory_commit_sha}
+    end
+  end
+
+  defp validate_factory_commit_shas(%{"type" => type})
+       when type in ["diff.updated", "phase.completed"],
+       do: {:error, :invalid_factory_commit_shas}
+
+  defp validate_factory_commit_shas(_event), do: :ok
+
+  defp validate_factory_pr_head(
+         state,
+         issue_id,
+         %{"type" => "pr.updated", "payload" => %{"headSha" => head_sha}}
+       )
+       when is_binary(head_sha) do
+    issue_commits = Map.get(state.factory_issue_commits, issue_id, MapSet.new())
+
+    cond do
+      !Regex.match?(@git_sha, head_sha) -> {:error, :invalid_factory_pr_head_sha}
+      !MapSet.member?(issue_commits, String.downcase(head_sha)) -> {:error, :factory_pr_head_not_reported}
+      true -> :ok
+    end
+  end
+
+  defp validate_factory_pr_head(_state, _issue_id, %{"type" => "pr.updated"}),
+    do: {:error, :invalid_factory_pr_head_sha}
+
+  defp validate_factory_pr_head(_state, _issue_id, _event), do: :ok
+
+  defp decorate_factory_event(state, issue_id, event) do
+    phase = event["phase"]
+    agent_id = event["agentId"] || if(event["type"] == "agent.started", do: event["eventId"])
+    role_key = {issue_id, phase, agent_id || "phase"}
+    role = get_in(event, ["payload", "role"]) || state.factory_roles[role_key] || phase
+    next_state = %{state | factory_roles: Map.put(state.factory_roles, role_key, role)}
+    {Map.put(event, "role", role), next_state}
+  end
+
+  defp record_factory_event_state(state, issue_id, event, event_session_id) do
+    current = Map.get(state.factory_issue_state, issue_id, %{})
+
+    updated =
+      case event do
+        %{"type" => "phase.completed", "phase" => "qa"} ->
+          Map.put(current, :qa_completed, true)
+
+        %{"type" => "pr.updated", "payload" => payload} ->
+          current
+          |> Map.put(:merged, payload["state"] == "merged")
+          |> Map.put(:quality_passed, quality_gate_passed?(payload["qualityCheck"]))
+
+        _event ->
+          current
+      end
+
+    state = %{state | factory_issue_state: Map.put(state.factory_issue_state, issue_id, updated)}
+    record_factory_change_state(state, issue_id, event, event_session_id)
+  end
+
+  defp record_factory_change_state(
+         state,
+         issue_id,
+         %{"type" => "diff.updated", "phase" => phase, "payload" => payload} = event,
+         event_session_id
+       ) do
+    commit_shas = normalized_commit_shas(payload)
+    agent_key = {issue_id, phase, event["agentId"] || "phase"}
+
+    phase_changes =
+      Map.update(
+        state.factory_phase_changes,
+        agent_key,
+        commit_shas,
+        &MapSet.union(&1, commit_shas)
+      )
+
+    next_state = %{
+      state
+      | factory_phase_changes: phase_changes,
+        factory_change_sessions: Map.put(state.factory_change_sessions, agent_key, event_session_id)
+    }
+
+    put_factory_issue_commits(next_state, issue_id, commit_shas)
+  end
+
+  defp record_factory_change_state(
+         state,
+         issue_id,
+         %{"type" => "phase.completed", "payload" => payload},
+         _event_session_id
+       ) do
+    put_factory_issue_commits(state, issue_id, normalized_commit_shas(payload))
+  end
+
+  defp record_factory_change_state(state, _issue_id, _event, _event_session_id), do: state
+
+  defp put_factory_issue_commits(state, issue_id, commit_shas) do
+    commits =
+      Map.update(
+        state.factory_issue_commits,
+        issue_id,
+        commit_shas,
+        &MapSet.union(&1, commit_shas)
+      )
+
+    %{state | factory_issue_commits: commits}
+  end
+
+  defp normalized_commit_shas(payload) do
+    payload
+    |> Map.get("commitShas", [])
+    |> Enum.map(&String.downcase/1)
+    |> MapSet.new()
+  end
+
+  defp quality_gate_passed?(%{"name" => "factory/quality-gate", "status" => "passed"}),
+    do: true
+
+  defp quality_gate_passed?(_quality_check), do: false
+
+  defp begin_factory_work(state, issue_id) do
+    settings = Config.settings!()
+
+    if settings.factory.enabled do
+      factory = settings.factory
+
+      with {:ok, feedback_state} <- Policy.feedback_state(factory),
+           :ok <- require_non_terminal_factory_state(feedback_state, settings.tracker.terminal_states),
+           {:ok, _issue} <-
+             state.client.transition_issue_from(
+               issue_id,
+               Enum.uniq(["Todo", feedback_state]),
+               feedback_state,
+               client_opts(state)
+             ) do
+        :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  defp factory_lifecycle_ready?(issue_state) do
+    factory = Config.settings!().factory
+
+    issue_state[:qa_completed] == true and
+      Map.get(issue_state, :post_merge_completed, true) == true and
+      (!factory.github.enabled or
+         (issue_state[:merged] == true and issue_state[:quality_passed] == true))
+  end
+
+  defp validate_lifecycle_facts(facts) do
+    required_booleans = [:qa_completed, :github_enabled, :merged, :quality_passed, :post_merge_completed]
+
+    cond do
+      !Enum.all?(required_booleans, &is_boolean(facts[&1])) ->
+        {:error, :invalid_factory_lifecycle_facts}
+
+      !is_nil(facts[:integrated_head]) and
+          !(is_binary(facts[:integrated_head]) and Regex.match?(@git_sha, facts[:integrated_head])) ->
+        {:error, :invalid_factory_lifecycle_facts}
+
+      !valid_lifecycle_change_bindings?(facts[:change_bindings]) ->
+        {:error, :invalid_factory_lifecycle_facts}
+
+      facts[:github_enabled] != Config.settings!().factory.github.enabled ->
+        {:error, :factory_lifecycle_configuration_mismatch}
+
+      true ->
+        {:ok, Map.put(facts, :change_bindings, facts[:change_bindings] || [])}
+    end
+  end
+
+  defp valid_lifecycle_change_bindings?(nil), do: true
+
+  defp valid_lifecycle_change_bindings?(bindings) when is_list(bindings) do
+    keys = Enum.map(bindings, &{&1[:phase], &1[:agent_id], &1[:session_id]})
+
+    Enum.uniq(keys) == keys and
+      Enum.all?(bindings, fn binding ->
+        is_map(binding) and binding[:phase] in SymphonyElixir.Factory.Protocol.phases() and
+          nonempty_lifecycle_value?(binding[:agent_id]) and
+          nonempty_lifecycle_value?(binding[:session_id]) and
+          is_list(binding[:commit_shas]) and
+          Enum.all?(binding[:commit_shas], &(is_binary(&1) and Regex.match?(@git_sha, &1)))
+      end)
+  end
+
+  defp valid_lifecycle_change_bindings?(_bindings), do: false
+
+  defp nonempty_lifecycle_value?(value), do: is_binary(value) and String.trim(value) != ""
+
+  defp restore_factory_change_bindings(state, issue_id, bindings) do
+    Enum.reduce(bindings, state, fn binding, current_state ->
+      key = {issue_id, binding.phase, binding.agent_id}
+      commits = MapSet.new(Enum.map(binding.commit_shas, &String.downcase/1))
+
+      phase_changes =
+        Map.update(current_state.factory_phase_changes, key, commits, &MapSet.union(&1, commits))
+
+      current_state
+      |> Map.put(:factory_phase_changes, phase_changes)
+      |> Map.put(
+        :factory_change_sessions,
+        Map.put(current_state.factory_change_sessions, key, binding.session_id)
+      )
+      |> put_factory_issue_commits(issue_id, commits)
+    end)
+  end
+
+  defp restore_factory_issue_commit(commits, _issue_id, nil), do: commits
+
+  defp restore_factory_issue_commit(commits, issue_id, head) do
+    Map.put(commits, issue_id, MapSet.new([String.downcase(head)]))
+  end
+
+  defp unprocessed_factory_feedback?(state, issue_id) do
+    pending_ids =
+      state.pending_prompts
+      |> Map.get(issue_id, [])
+      |> Enum.map(&prompt_entry_id/1)
+      |> MapSet.new()
+
+    inflight_ids =
+      state.factory_feedback_inflight
+      |> Map.get(issue_id, [])
+      |> Enum.map(&prompt_entry_id/1)
+      |> MapSet.new()
+
+    !MapSet.subset?(pending_ids, inflight_ids)
+  end
+
+  defp reopen_for_feedback_async(state, issue_id, attempt) do
+    bridge = self()
+
+    run_async(fn ->
+      send(
+        bridge,
+        {:factory_feedback_reopen_result, issue_id, attempt, reopen_for_feedback(state, issue_id)}
+      )
+    end)
+  end
+
+  defp feedback_retry_ms(attempt), do: min(250 * trunc(:math.pow(2, min(attempt - 1, 6))), 15_000)
+
+  defp prompt_entry_id(entry), do: entry[:id] || entry["id"]
+
+  defp known_prompt?(state, issue_id, prompt_id) when is_binary(prompt_id) do
+    [state.pending_prompts, state.factory_feedback_inflight]
+    |> Enum.flat_map(&Map.get(&1, issue_id, []))
+    |> Enum.any?(&(prompt_entry_id(&1) == prompt_id))
+  end
+
+  defp known_prompt?(_state, _issue_id, _prompt_id), do: false
+
+  defp reopen_for_feedback(state, issue_id) do
+    settings = Config.settings!()
+    factory = settings.factory
+
+    with {:ok, feedback_state} <- Policy.feedback_state(factory),
+         :ok <- require_non_terminal_factory_state(feedback_state, settings.tracker.terminal_states),
+         {:ok, _issue} <-
+           state.client.transition_issue_from(
+             issue_id,
+             Enum.uniq([factory.review_state, feedback_state]),
+             feedback_state,
+             client_opts(state)
+           ) do
+      :ok
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp require_non_terminal_factory_state(state_name, terminal_states) do
+    if terminal_factory_state?(state_name, terminal_states),
+      do: {:error, :factory_terminal_state_forbidden},
+      else: :ok
+  end
+
+  defp terminal_factory_state?(state_name, terminal_states) when is_binary(state_name) do
+    normalized = state_name |> String.trim() |> String.downcase()
+
+    Enum.any?(terminal_states, fn terminal_state ->
+      is_binary(terminal_state) and String.downcase(String.trim(terminal_state)) == normalized
+    end)
+  end
+
+  defp terminal_factory_state?(_state_name, _terminal_states), do: true
+
+  defp phase_name(phase) when is_binary(phase), do: phase |> String.replace("_", " ") |> String.capitalize()
+  defp role_name(role) when is_binary(role), do: role |> String.replace(["_", "-"], " ") |> String.capitalize()
+
+  defp role_text(role, text) when is_binary(text) do
+    "[#{role_name(role)}] #{safe_activity_text(text, 4_000)}"
+  end
+
+  defp require_factory_artifact_url(url, key) do
+    allowed_hosts = Config.settings!().factory.proof_url_hosts |> Enum.map(&String.downcase/1)
+
+    with value when is_binary(value) <- url,
+         %URI{scheme: "https", host: host, userinfo: nil, port: port}
+         when is_binary(host) and host != "" and port in [nil, 443] <- URI.parse(value),
+         true <- String.downcase(host) in allowed_hosts do
+      :ok
+    else
+      _uri -> {:error, {:factory_artifact_requires_https_url, key}}
+    end
+  end
+
   defp reasoning_summary(%{"summary" => summary}) when is_list(summary) do
     summary
     |> Enum.filter(&is_binary/1)
@@ -1009,6 +2109,44 @@ defmodule SymphonyElixir.Linear.AgentBridge do
       {:ok, %{} = session} -> {:ok, session}
       :not_found -> state.client.create_session(issue_id, client_opts(state))
       {:error, reason} -> {:error, {:linear_agent_session_lookup_failed, reason}}
+    end
+  end
+
+  defp ensure_phase_session_in_state(state, issue_id, phase) do
+    cond do
+      !Config.settings!().linear_agent.enabled ->
+        :disabled
+
+      session_id = get_in(state.phase_sessions_by_issue, [issue_id, phase]) ->
+        {:ok, session_id, state}
+
+      phase == "planning" and is_binary(session_id(state, issue_id)) ->
+        initialize_existing_phase_session(state, issue_id, phase, session_id(state, issue_id))
+
+      true ->
+        create_phase_session(state, issue_id, phase)
+    end
+  end
+
+  defp create_phase_session(state, issue_id, phase) do
+    case state.client.create_session(issue_id, client_opts(state)) do
+      {:ok, %{"id" => session_id}} when is_binary(session_id) ->
+        initialize_existing_phase_session(state, issue_id, phase, session_id)
+
+      {:error, reason} ->
+        {:error, reason}
+
+      other ->
+        {:error, {:invalid_agent_session_response, other}}
+    end
+  end
+
+  defp initialize_existing_phase_session(state, issue_id, phase, session_id) do
+    next_state = put_phase_session(state, issue_id, phase, session_id)
+
+    case initialize_phase_session(next_state, session_id, phase) do
+      :ok -> {:ok, session_id, next_state}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -1144,6 +2282,22 @@ defmodule SymphonyElixir.Linear.AgentBridge do
     end
   end
 
+  defp close_sessions(state, issue_id, session_ids, summary) do
+    activity_results =
+      Enum.map(session_ids, fn session_id ->
+        create_activity(state, session_id, %{"type" => "response", "body" => summary})
+      end)
+
+    delegate_result = state.client.clear_issue_delegate(issue_id, client_opts(state))
+
+    case {Enum.find(activity_results, &match?({:error, _reason}, &1)), delegate_result} do
+      {nil, {:ok, %{"delegate" => nil}}} -> :ok
+      {nil, {:ok, issue}} -> {:error, {:linear_agent_assignment_not_cleared, issue}}
+      {{:error, reason}, _delegate_result} -> {:error, reason}
+      {nil, {:error, reason}} -> {:error, {:linear_agent_assignment_clear_failed, reason}}
+    end
+  end
+
   defp request_waiting_session(state, issue_id, app_user_id) do
     bridge = self()
 
@@ -1236,11 +2390,65 @@ defmodule SymphonyElixir.Linear.AgentBridge do
     }
   end
 
-  defp delete_session(state, issue_id, session_id) do
+  defp put_phase_session(state, issue_id, phase, session_id) do
+    state = if phase == "planning", do: put_session(state, issue_id, session_id), else: state
+
+    phase_sessions =
+      state.phase_sessions_by_issue
+      |> Map.get(issue_id, %{})
+      |> Map.put(phase, session_id)
+
+    %{
+      state
+      | phase_sessions_by_issue: Map.put(state.phase_sessions_by_issue, issue_id, phase_sessions),
+        phase_by_session: Map.put(state.phase_by_session, session_id, {issue_id, phase}),
+        issue_by_session: Map.put(state.issue_by_session, session_id, issue_id)
+    }
+  end
+
+  defp session_ids_for_issue(state, issue_id) do
+    phase_session_ids =
+      state.phase_sessions_by_issue
+      |> Map.get(issue_id, %{})
+      |> Map.values()
+
+    agent_session_ids =
+      state.factory_agent_sessions
+      |> Enum.flat_map(fn
+        {{^issue_id, _phase, _agent_id}, session_id} -> [session_id]
+        {_key, _session_id} -> []
+      end)
+
+    [session_id(state, issue_id) | phase_session_ids ++ agent_session_ids]
+    |> Enum.filter(&is_binary/1)
+    |> Enum.uniq()
+  end
+
+  defp delete_issue_sessions(state, issue_id, session_ids) do
     %{
       state
       | sessions_by_issue: Map.delete(state.sessions_by_issue, issue_id),
-        issue_by_session: Map.delete(state.issue_by_session, session_id),
+        issue_by_session: Map.drop(state.issue_by_session, session_ids),
+        phase_sessions_by_issue: Map.delete(state.phase_sessions_by_issue, issue_id),
+        phase_by_session: Map.drop(state.phase_by_session, session_ids),
+        factory_agent_sessions:
+          Map.reject(state.factory_agent_sessions, fn {{mapped_issue_id, _phase, _agent_id}, _session_id} ->
+            mapped_issue_id == issue_id
+          end),
+        factory_roles:
+          Map.reject(state.factory_roles, fn {{mapped_issue_id, _phase, _agent_id}, _role} ->
+            mapped_issue_id == issue_id
+          end),
+        factory_issue_state: Map.delete(state.factory_issue_state, issue_id),
+        factory_phase_changes:
+          Map.reject(state.factory_phase_changes, fn {{mapped_issue_id, _phase, _agent_id}, _changes} ->
+            mapped_issue_id == issue_id
+          end),
+        factory_change_sessions:
+          Map.reject(state.factory_change_sessions, fn {{mapped_issue_id, _phase, _agent_id}, _session_id} ->
+            mapped_issue_id == issue_id
+          end),
+        factory_issue_commits: Map.delete(state.factory_issue_commits, issue_id),
         waiting_issues: MapSet.delete(state.waiting_issues, issue_id),
         work_started_issues: MapSet.delete(state.work_started_issues, issue_id)
     }
@@ -1249,7 +2457,21 @@ defmodule SymphonyElixir.Linear.AgentBridge do
   defp session_id(state, issue_id), do: state.sessions_by_issue[issue_id]
 
   defp remember_webhook(state, webhook_id) when is_binary(webhook_id) do
-    %{state | seen_webhooks: MapSet.put(state.seen_webhooks, webhook_id)}
+    seen = MapSet.put(state.seen_webhooks, webhook_id)
+
+    seen =
+      if MapSet.size(seen) > @max_seen_webhooks do
+        seen
+        |> Enum.reject(&(&1 == webhook_id))
+        |> Enum.sort()
+        |> Enum.take(-(@max_seen_webhooks - 1))
+        |> MapSet.new()
+        |> MapSet.put(webhook_id)
+      else
+        seen
+      end
+
+    %{state | seen_webhooks: seen}
   end
 
   defp remember_webhook(state, _webhook_id), do: state
@@ -1261,5 +2483,145 @@ defmodule SymphonyElixir.Linear.AgentBridge do
 
   defp escape_alt_text(caption) do
     String.replace(caption, ["]", "["], "")
+  end
+
+  defp load_durable_feedback(path) when is_binary(path) do
+    case File.read(path) do
+      {:ok, bytes} ->
+        decode_durable_feedback(bytes)
+
+      {:error, :enoent} ->
+        {:ok,
+         %{
+           pending_prompts: %{},
+           factory_feedback_inflight: %{},
+           seen_webhooks: MapSet.new()
+         }}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp load_durable_feedback(nil) do
+    {:ok,
+     %{
+       pending_prompts: %{},
+       factory_feedback_inflight: %{},
+       seen_webhooks: MapSet.new()
+     }}
+  end
+
+  defp decode_durable_feedback(bytes) do
+    with {:ok,
+          %{
+            "version" => @durable_feedback_version,
+            "pendingPrompts" => pending,
+            "inflightFeedback" => inflight,
+            "seenWebhooks" => seen
+          }} <- Jason.decode(bytes),
+         {:ok, pending} <- validate_durable_prompt_map(pending),
+         {:ok, inflight} <- validate_durable_prompt_map(inflight),
+         true <- is_list(seen) and length(seen) <= @max_seen_webhooks,
+         true <- Enum.uniq(seen) == seen and Enum.all?(seen, &valid_durable_id?/1) do
+      {:ok,
+       %{
+         pending_prompts: pending,
+         factory_feedback_inflight: inflight,
+         seen_webhooks: MapSet.new(seen)
+       }}
+    else
+      _invalid -> {:error, :invalid_durable_factory_feedback}
+    end
+  end
+
+  defp validate_durable_prompt_map(value) when is_map(value) do
+    Enum.reduce_while(value, {:ok, %{}}, fn {issue_id, prompts}, {:ok, acc} ->
+      with true <- valid_durable_id?(issue_id),
+           true <- is_list(prompts) and length(prompts) <= 1_000,
+           {:ok, prompts} <- validate_durable_prompts(prompts) do
+        {:cont, {:ok, Map.put(acc, issue_id, prompts)}}
+      else
+        _invalid -> {:halt, {:error, :invalid_durable_factory_feedback}}
+      end
+    end)
+  end
+
+  defp validate_durable_prompt_map(_value), do: {:error, :invalid_durable_factory_feedback}
+
+  defp validate_durable_prompts(prompts) do
+    Enum.reduce_while(prompts, {:ok, []}, fn prompt, {:ok, acc} ->
+      case normalize_durable_prompt(prompt) do
+        {:ok, normalized} -> {:cont, {:ok, acc ++ [normalized]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp normalize_durable_prompt(%{"id" => id, "body" => body, "action" => action})
+       when is_binary(id) and is_binary(body) and action in ["created", "prompted"] do
+    if valid_durable_id?(id) and byte_size(body) <= 100_000,
+      do: {:ok, %{id: id, body: body, action: action}},
+      else: {:error, :invalid_durable_factory_feedback}
+  end
+
+  defp normalize_durable_prompt(_prompt), do: {:error, :invalid_durable_factory_feedback}
+
+  defp valid_durable_id?(value) when is_binary(value), do: value != "" and byte_size(value) <= 500
+  defp valid_durable_id?(_value), do: false
+
+  defp persist_durable_feedback(%__MODULE__{durable_feedback_path: path} = state)
+       when is_binary(path) do
+    payload = %{
+      "version" => @durable_feedback_version,
+      "pendingPrompts" => durable_prompt_map(state.pending_prompts),
+      "inflightFeedback" => durable_prompt_map(state.factory_feedback_inflight),
+      "seenWebhooks" => state.seen_webhooks |> Enum.sort() |> Enum.take(-@max_seen_webhooks)
+    }
+
+    directory = Path.dirname(path)
+    temporary = path <> ".tmp-#{System.unique_integer([:positive])}"
+
+    result =
+      with :ok <- File.mkdir_p(directory),
+           :ok <- File.chmod(directory, 0o700),
+           :ok <- File.write(temporary, Jason.encode!(payload), [:binary, :exclusive]),
+           :ok <- File.chmod(temporary, 0o600) do
+        File.rename(temporary, path)
+      end
+
+    case result do
+      :ok ->
+        state
+
+      {:error, reason} ->
+        _ = File.rm(temporary)
+        raise "could not persist durable factory feedback: #{inspect(reason)}"
+    end
+  end
+
+  defp persist_durable_feedback(%__MODULE__{} = state), do: state
+
+  defp persist_webhook_state(state) do
+    {:ok, persist_durable_feedback(state)}
+  rescue
+    error -> {:error, Exception.message(error)}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp durable_prompt_map(prompt_map) do
+    Map.new(prompt_map, fn {issue_id, prompts} ->
+      serialized =
+        Enum.map(prompts, fn prompt ->
+          %{
+            "id" => prompt_entry_id(prompt),
+            "body" => prompt[:body] || prompt["body"],
+            "action" => prompt[:action] || prompt["action"]
+          }
+        end)
+
+      {issue_id, serialized}
+    end)
   end
 end

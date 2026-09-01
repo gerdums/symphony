@@ -70,6 +70,14 @@ defmodule SymphonyElixir.Linear.AgentClient do
     }
   }
   """
+  @session_external_links_query """
+  query SymphonyAgentSessionExternalLinks($id: String!) {
+    agentSession(id: $id) {
+      id
+      externalLinks { label url }
+    }
+  }
+  """
   @assign_issue_mutation """
   mutation SymphonyAssignIssue($issueId: String!, $delegateId: String!) {
     issueUpdate(id: $issueId, input: {delegateId: $delegateId}) {
@@ -83,6 +91,23 @@ defmodule SymphonyElixir.Linear.AgentClient do
     issueUpdate(id: $issueId, input: {delegateId: null}) {
       success
       issue { id delegate { id } }
+    }
+  }
+  """
+  @issue_state_query """
+  query SymphonyIssueState($issueId: String!) {
+    issue(id: $issueId) {
+      id
+      state { name }
+      team { states(first: 100) { nodes { id name } } }
+    }
+  }
+  """
+  @update_issue_state_mutation """
+  mutation SymphonyUpdateIssueState($issueId: String!, $stateId: String!) {
+    issueUpdate(id: $issueId, input: {stateId: $stateId}) {
+      success
+      issue { id state { name } }
     }
   }
   """
@@ -161,6 +186,29 @@ defmodule SymphonyElixir.Linear.AgentClient do
     end
   end
 
+  @spec ensure_external_url(String.t(), String.t(), String.t(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def ensure_external_url(agent_session_id, label, url, opts \\ [])
+      when is_binary(agent_session_id) and is_binary(label) and is_binary(url) do
+    with {:ok, body} <-
+           graphql(
+             @session_external_links_query,
+             %{"id" => agent_session_id},
+             opts
+           ),
+         {:ok, session} <- get_graphql_data(body, ["agentSession"]) do
+      if external_url_present?(session["externalLinks"], url) do
+        {:ok, session}
+      else
+        update_session(
+          agent_session_id,
+          %{"addedExternalUrls" => [%{"label" => label, "url" => url}]},
+          opts
+        )
+      end
+    end
+  end
+
   @spec assign_issue(String.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
   def assign_issue(issue_id, delegate_id, opts \\ [])
       when is_binary(issue_id) and is_binary(delegate_id) do
@@ -175,6 +223,67 @@ defmodule SymphonyElixir.Linear.AgentClient do
   def clear_issue_delegate(issue_id, opts \\ []) when is_binary(issue_id) do
     with {:ok, body} <- graphql(@clear_issue_delegate_mutation, %{"issueId" => issue_id}, opts) do
       get_graphql_data(body, ["issueUpdate", "issue"])
+    end
+  end
+
+  @spec issue_state(String.t(), keyword()) :: {:ok, String.t()} | {:error, term()}
+  def issue_state(issue_id, opts \\ []) when is_binary(issue_id) do
+    with {:ok, body} <- graphql(@issue_state_query, %{"issueId" => issue_id}, opts) do
+      case get_in(body, ["data", "issue", "state", "name"]) do
+        state_name when is_binary(state_name) -> {:ok, state_name}
+        other -> {:error, {:linear_agent_unknown_payload, other}}
+      end
+    end
+  end
+
+  @spec transition_issue(String.t(), String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def transition_issue(issue_id, state_name, opts \\ [])
+      when is_binary(issue_id) and is_binary(state_name) do
+    with {:ok, body} <- graphql(@issue_state_query, %{"issueId" => issue_id}, opts),
+         {:ok, state_id} <- resolve_state_id(body, state_name),
+         {:ok, update_body} <-
+           graphql(
+             @update_issue_state_mutation,
+             %{"issueId" => issue_id, "stateId" => state_id},
+             opts
+           ) do
+      get_graphql_data(update_body, ["issueUpdate", "issue"])
+    end
+  end
+
+  @spec transition_issue_from(String.t(), [String.t()], String.t(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def transition_issue_from(issue_id, allowed_states, state_name, opts \\ [])
+      when is_binary(issue_id) and is_list(allowed_states) and is_binary(state_name) do
+    with {:ok, body} <- graphql(@issue_state_query, %{"issueId" => issue_id}, opts),
+         %{"state" => %{"name" => current_state}} = issue when is_binary(current_state) <-
+           get_in(body, ["data", "issue"]) do
+      cond do
+        same_state_value?(current_state, state_name) ->
+          {:ok, issue}
+
+        !Enum.any?(allowed_states, &same_state_value?(&1, current_state)) ->
+          {:error, {:linear_agent_transition_forbidden, issue_id}}
+
+        true ->
+          perform_issue_transition(body, issue_id, state_name, opts)
+      end
+    else
+      nil -> {:error, {:linear_agent_unknown_payload, nil}}
+      {:error, _reason} = error -> error
+      other -> {:error, {:linear_agent_unknown_payload, other}}
+    end
+  end
+
+  defp perform_issue_transition(body, issue_id, state_name, opts) do
+    with {:ok, state_id} <- resolve_state_id(body, state_name),
+         {:ok, update_body} <-
+           graphql(
+             @update_issue_state_mutation,
+             %{"issueId" => issue_id, "stateId" => state_id},
+             opts
+           ) do
+      get_graphql_data(update_body, ["issueUpdate", "issue"])
     end
   end
 
@@ -225,6 +334,15 @@ defmodule SymphonyElixir.Linear.AgentClient do
   defp agent_settings(opts) do
     Keyword.get_lazy(opts, :agent_settings, fn -> Config.settings!().linear_agent end)
   end
+
+  defp external_url_present?(links, url) when is_list(links) do
+    Enum.any?(links, fn
+      %{"url" => ^url} -> true
+      _link -> false
+    end)
+  end
+
+  defp external_url_present?(_links, _url), do: false
 
   defp request_graphql(payload, settings, request_fun, opts, retry_auth?) do
     with {:ok, headers} <- request_headers(settings, opts),
@@ -290,6 +408,28 @@ defmodule SymphonyElixir.Linear.AgentClient do
       end
     end
   end
+
+  defp resolve_state_id(body, state_name) do
+    states = get_in(body, ["data", "issue", "team", "states", "nodes"])
+
+    case Enum.filter(states || [], &same_state_name?(&1, state_name)) do
+      [%{"id" => state_id}] when is_binary(state_id) -> {:ok, state_id}
+      [] -> {:error, {:linear_agent_state_not_found, state_name}}
+      matches -> {:error, {:linear_agent_ambiguous_state, state_name, length(matches)}}
+    end
+  end
+
+  defp same_state_name?(%{"name" => name}, expected) when is_binary(name) do
+    same_state_value?(name, expected)
+  end
+
+  defp same_state_name?(_state, _expected), do: false
+
+  defp same_state_value?(left, right) when is_binary(left) and is_binary(right) do
+    String.downcase(String.trim(left)) == String.downcase(String.trim(right))
+  end
+
+  defp same_state_value?(_left, _right), do: false
 
   defp list_open_sessions_page(app_user_id, project_id, after_cursor, acc, opts) do
     variables = %{"first" => @session_page_size, "after" => after_cursor}
